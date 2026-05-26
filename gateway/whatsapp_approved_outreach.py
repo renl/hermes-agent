@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
 import threading
 from datetime import date, datetime, time
@@ -55,6 +56,37 @@ WHATSAPP_ALLOWED_DRAFT_OUTCOMES = (
 _JSON_PRIMITIVE_TYPES = (str, int, float, bool, type(None))
 
 _OUTREACH_STATE_LOCK = threading.Lock()
+
+_CLOSEOUT_STAGE_PATTERNS = (
+    re.compile(
+        r"\b(accept|accepted|agree|agreed|approved|confirm|confirmed|booked|done|"
+        r"complete|completed|finished|paid|decline|declined|not interested|pass|"
+        r"stop|cancel|cancelled|won't proceed|will not proceed)\b"
+    ),
+    re.compile(r"\blet'?s proceed\b"),
+    re.compile(r"\bgo ahead\b"),
+)
+_NEGOTIATION_STAGE_PATTERNS = (
+    re.compile(
+        r"\b(counter|counteroffer|offer|price|pricing|discount|budget|rate|rates|"
+        r"term|terms|quote|proposal|contract|fee|fees|cost|costs|deposit)\b"
+    ),
+    re.compile(r"\bpayment terms\b"),
+)
+_CLARIFICATION_STAGE_PATTERNS = (
+    re.compile(r"\?$"),
+    re.compile(
+        r"\b(who|what|when|where|why|how|which|can you|could you|would you|do you|"
+        r"did you|is it|are you|will you|please confirm|please share)\b"
+    ),
+)
+_SUCCESS_EXECUTION_STATUSES = {"sent", "no_send_required"}
+_BLOCKING_EXECUTION_STATUSES = {"handoff_required", "blocked"}
+_PARTIAL_REPORT_EXECUTION_STATUSES = {
+    "handoff_required",
+    "blocked",
+    "send_failed",
+}
 
 
 def is_whatsapp_approved_outreach_instruction(text: str | None) -> bool:
@@ -436,6 +468,7 @@ def _status_basis_for_observable_status(observable_status: str) -> str:
         "follow_up_recommended",
         "unresolved",
         "send_failed",
+        "handoff_required",
     }:
         return "bounded_model_synthesis"
     return "direct_conversation_evidence"
@@ -444,6 +477,8 @@ def _status_basis_for_observable_status(observable_status: str) -> str:
 def _observable_status_from_history_and_execution(
     history_rows: list[dict[str, Any]], execution_status: str
 ) -> str:
+    if execution_status == "handoff_required":
+        return "handoff_required"
     if execution_status == "send_failed":
         return "send_failed"
     if execution_status == "sent":
@@ -605,25 +640,73 @@ def _resolve_bound_plan_request(
 def _observable_status_for_execution_status(execution_status: str) -> str:
     if execution_status == "sent":
         return "awaiting_reply"
+    if execution_status == "handoff_required":
+        return "handoff_required"
     if execution_status == "send_failed":
         return "send_failed"
     return "unresolved"
 
 
 def _status_basis_for_execution_status(execution_status: str) -> str:
-    if execution_status == "sent":
+    if execution_status in {"sent", "handoff_required"}:
         return "bounded_model_synthesis"
     return "direct_conversation_evidence"
 
 
 def _normalized_communication_skill_name(value: Any) -> str:
-    return (
-        str(value or "").strip() or WHATSAPP_DEFAULT_COMMUNICATION_SKILL_NAME
-    )
+    return str(value or "").strip() or WHATSAPP_DEFAULT_COMMUNICATION_SKILL_NAME
+
+
+def _history_text(row: dict[str, Any]) -> str:
+    return str(row.get("text") or "").strip().lower()
+
+
+def _row_matches_any_pattern(
+    row: dict[str, Any], patterns: tuple[re.Pattern[str], ...]
+) -> bool:
+    text = _history_text(row)
+    return any(pattern.search(text) for pattern in patterns)
+
+
+def _latest_unresolved_external_party_turn(
+    history_rows: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    latest_agent_index: int | None = None
+    for index, row in enumerate(history_rows):
+        if row.get("participant_role") == "agent":
+            latest_agent_index = index
+
+    for index in range(len(history_rows) - 1, -1, -1):
+        row = history_rows[index]
+        if row.get("participant_role") != "external_party":
+            continue
+        if latest_agent_index is None or index > latest_agent_index:
+            return row
+        return None
+    return None
 
 
 def _select_communication_stage(history_rows: list[dict[str, Any]]) -> str:
-    if any(row.get("participant_role") == "agent" for row in history_rows):
+    has_prior_agent_outbound = any(
+        row.get("participant_role") == "agent" for row in history_rows
+    )
+    unresolved_external_turn = _latest_unresolved_external_party_turn(history_rows)
+
+    if unresolved_external_turn is not None:
+        if _row_matches_any_pattern(unresolved_external_turn, _CLOSEOUT_STAGE_PATTERNS):
+            return "closeout"
+        if _row_matches_any_pattern(
+            unresolved_external_turn, _NEGOTIATION_STAGE_PATTERNS
+        ):
+            return "negotiation"
+        if _row_matches_any_pattern(
+            unresolved_external_turn, _CLARIFICATION_STAGE_PATTERNS
+        ):
+            return "clarification"
+        if has_prior_agent_outbound:
+            return "follow_up"
+
+    if has_prior_agent_outbound:
         return "follow_up"
     return "opening_outreach"
 
@@ -1108,8 +1191,10 @@ async def execute_whatsapp_approved_outreach(
             else:
                 plan_row = dict(plan_row)
                 plan_row["plan_status"] = "active"
-                plan_row["communication_skill_name"] = _normalized_communication_skill_name(
-                    plan_row.get("communication_skill_name")
+                plan_row["communication_skill_name"] = (
+                    _normalized_communication_skill_name(
+                        plan_row.get("communication_skill_name")
+                    )
                 )
                 plan_row["approved_at_utc"] = (
                     plan_row.get("approved_at_utc") or approved_at_utc
@@ -1301,9 +1386,7 @@ async def execute_whatsapp_approved_outreach(
                 execution["communication_skill_name"] = draft_request[
                     "communication_skill_name"
                 ]
-                execution["communication_stage"] = draft_request[
-                    "communication_stage"
-                ]
+                execution["communication_stage"] = draft_request["communication_stage"]
                 execution["message_generation_mode"] = "skill_generated"
                 execution["draft_outcome"] = draft["draft_outcome"]
                 execution["outbound_message_text"] = draft["outbound_message_text"]
@@ -1370,10 +1453,11 @@ async def execute_whatsapp_approved_outreach(
             "observable_status": observable_status,
             "status_basis": _status_basis_for_observable_status(observable_status),
             "latest_observed_message_at_utc": history_window_end_utc,
+            "handoff_reason": execution.get("handoff_reason"),
             "open_items": [],
             "uncertainties": row_uncertainties,
         })
-        if execution["execution_status"] in {"blocked", "send_failed"}:
+        if execution["execution_status"] in _PARTIAL_REPORT_EXECUTION_STATUSES:
             failed_count += 1
         completed_count += 1
 
@@ -1382,18 +1466,41 @@ async def execute_whatsapp_approved_outreach(
     if run_window_end_utc is None:
         run_window_end_utc = run_window_start_utc
 
+    success_count = sum(
+        1
+        for execution in executions
+        if execution.get("execution_status") in _SUCCESS_EXECUTION_STATUSES
+    )
+    blocking_count = sum(
+        1
+        for execution in executions
+        if execution.get("execution_status") in _BLOCKING_EXECUTION_STATUSES
+    )
+    partial_report_count = sum(
+        1
+        for execution in executions
+        if execution.get("execution_status") in _PARTIAL_REPORT_EXECUTION_STATUSES
+    )
+
     if completed_count == 0:
         run["run_status"] = "blocked"
         founder_summary = "WhatsApp approved outreach stayed blocked because none of the approved targets could be executed."
-        report_status = "failed"
-    elif failed_count == 0:
+        report_status = "partial" if target_rows else "failed"
+    elif success_count == completed_count:
         run["run_status"] = "completed"
         founder_summary = (
             f"WhatsApp approved outreach executed {completed_count} approved target"
             f"{'s' if completed_count != 1 else ''} through isolated single-target steps and produced an evidence-bounded run report."
         )
         report_status = "ready"
-    elif failed_count < completed_count:
+    elif success_count == 0 and blocking_count > 0:
+        run["run_status"] = "blocked"
+        founder_summary = (
+            "WhatsApp approved outreach stayed blocked because none of the approved "
+            "targets reached a sendable or no-send terminal outcome."
+        )
+        report_status = "partial"
+    elif partial_report_count > 0 and success_count > 0:
         run["run_status"] = "completed_with_failures"
         founder_summary = (
             f"WhatsApp approved outreach executed {completed_count} approved targets with {failed_count} isolated failure"
@@ -1403,7 +1510,7 @@ async def execute_whatsapp_approved_outreach(
     else:
         run["run_status"] = "failed"
         founder_summary = "WhatsApp approved outreach attempted the approved target set but every isolated target execution failed or blocked."
-        report_status = "failed"
+        report_status = "partial" if partial_report_count else "failed"
 
     if failed_count:
         report_uncertainties.append(
@@ -1547,9 +1654,7 @@ def format_whatsapp_approved_outreach_result(result: dict[str, Any]) -> str:
         f"message_id: {execution.get('message_id')}",
     ])
     if execution.get("outbound_message_text"):
-        lines.append(
-            f"outbound_message_text: {execution.get('outbound_message_text')}"
-        )
+        lines.append(f"outbound_message_text: {execution.get('outbound_message_text')}")
     if execution.get("handoff_reason"):
         lines.append(f"handoff_reason: {execution.get('handoff_reason')}")
     if execution.get("last_error"):
