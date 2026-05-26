@@ -279,3 +279,63 @@ def test_query_latest_whatsapp_record_returns_latest_matching_exact_thread(tmp_p
 
     assert latest is not None
     assert latest["record_id"] == "latest"
+
+
+def test_query_whatsapp_records_treats_legacy_rows_as_production_scope_by_default(
+    tmp_path,
+):
+    base_dir = tmp_path / "records"
+
+    _append(
+        base_dir,
+        _record(
+            record_id="legacy-production",
+            effective_event_at_utc="2024-06-02T09:00:00Z",
+            record_sequence=1,
+            conversation_key="whatsapp:dm:15551230000",
+            destination_key="whatsapp:dm:15551230000",
+            destination_context_type="direct_message",
+            dm_counterparty_id="15551230000",
+            direction="inbound",
+        ),
+        datetime(2024, 6, 2, 9, 0, 0, tzinfo=timezone.utc),
+    )
+    _append(
+        base_dir,
+        {
+            **_record(
+                record_id="validation-row",
+                effective_event_at_utc="2024-06-02T09:05:00Z",
+                record_sequence=2,
+                conversation_key="whatsapp:dm:15551230000",
+                destination_key="whatsapp:dm:15551230000",
+                destination_context_type="direct_message",
+                dm_counterparty_id="15551230000",
+                direction="outbound",
+            ),
+            "continuity_scope_id": "scope-validation-1",
+            "continuity_scope_kind": "cold_start_validation",
+        },
+        datetime(2024, 6, 2, 9, 5, 0, tzinfo=timezone.utc),
+    )
+
+    production_records = query_whatsapp_records(
+        datetime(2024, 6, 2, 0, 0, 0, tzinfo=timezone.utc),
+        datetime(2024, 6, 3, 0, 0, 0, tzinfo=timezone.utc),
+        base_dir=base_dir,
+        destination_key="whatsapp:dm:15551230000",
+        continuity_scope_kind="production",
+    )
+    validation_records = query_whatsapp_records(
+        datetime(2024, 6, 2, 0, 0, 0, tzinfo=timezone.utc),
+        datetime(2024, 6, 3, 0, 0, 0, tzinfo=timezone.utc),
+        base_dir=base_dir,
+        destination_key="whatsapp:dm:15551230000",
+        continuity_scope_kind="cold_start_validation",
+        continuity_scope_id="scope-validation-1",
+    )
+
+    assert [record["record_id"] for record in production_records] == [
+        "legacy-production"
+    ]
+    assert [record["record_id"] for record in validation_records] == ["validation-row"]

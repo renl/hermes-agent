@@ -180,6 +180,27 @@ def _matches_exact_filter(
     return record.get(field_name) == expected
 
 
+def _matches_continuity_scope_filter(
+    record: dict[str, Any],
+    *,
+    continuity_scope_id: str | None,
+    continuity_scope_kind: str | None,
+) -> bool:
+    if continuity_scope_id is None and continuity_scope_kind is None:
+        return True
+
+    record_scope_id = record.get("continuity_scope_id")
+    record_scope_kind = record.get("continuity_scope_kind")
+    if continuity_scope_kind == "production" and record_scope_kind in {None, ""}:
+        return True
+
+    if continuity_scope_kind is not None and record_scope_kind != continuity_scope_kind:
+        return False
+    if continuity_scope_id is not None and record_scope_id != continuity_scope_id:
+        return False
+    return True
+
+
 def _iter_existing_partition_paths(*, base_dir: Path | None = None) -> list[Path]:
     store_dir = get_whatsapp_record_store_dir(base_dir)
     if not store_dir.exists():
@@ -197,6 +218,8 @@ def _load_filtered_whatsapp_records(
     destination_context_type: str | None,
     group_chat_id: str | None,
     dm_counterparty_id: str | None,
+    continuity_scope_id: str | None,
+    continuity_scope_kind: str | None,
     direction: str | None,
 ) -> list[dict[str, Any]]:
     results: list[tuple[datetime, int, dict[str, Any]]] = []
@@ -232,6 +255,12 @@ def _load_filtered_whatsapp_records(
                     record, "dm_counterparty_id", dm_counterparty_id
                 ):
                     continue
+                if not _matches_continuity_scope_filter(
+                    record,
+                    continuity_scope_id=continuity_scope_id,
+                    continuity_scope_kind=continuity_scope_kind,
+                ):
+                    continue
                 if not _matches_exact_filter(record, "direction", direction):
                     continue
 
@@ -261,6 +290,8 @@ def query_whatsapp_records(
     destination_context_type: str | None = None,
     group_chat_id: str | None = None,
     dm_counterparty_id: str | None = None,
+    continuity_scope_id: str | None = None,
+    continuity_scope_kind: str | None = None,
     direction: str | None = None,
 ) -> list[dict[str, Any]]:
     start = start_at_utc.astimezone(timezone.utc)
@@ -292,6 +323,8 @@ def query_whatsapp_records(
         destination_context_type=destination_context_type,
         group_chat_id=group_chat_id,
         dm_counterparty_id=dm_counterparty_id,
+        continuity_scope_id=continuity_scope_id,
+        continuity_scope_kind=continuity_scope_kind,
         direction=direction,
     )
 
@@ -304,6 +337,8 @@ def query_whatsapp_records_any_time(
     destination_context_type: str | None = None,
     group_chat_id: str | None = None,
     dm_counterparty_id: str | None = None,
+    continuity_scope_id: str | None = None,
+    continuity_scope_kind: str | None = None,
     direction: str | None = None,
 ) -> list[dict[str, Any]]:
     if not _has_destination_scope(
@@ -326,6 +361,8 @@ def query_whatsapp_records_any_time(
         destination_context_type=destination_context_type,
         group_chat_id=group_chat_id,
         dm_counterparty_id=dm_counterparty_id,
+        continuity_scope_id=continuity_scope_id,
+        continuity_scope_kind=continuity_scope_kind,
         direction=direction,
     )
 
@@ -353,6 +390,8 @@ def query_latest_whatsapp_record(
     destination_context_type: str | None = None,
     group_chat_id: str | None = None,
     dm_counterparty_id: str | None = None,
+    continuity_scope_id: str | None = None,
+    continuity_scope_kind: str | None = None,
     direction: str | None = None,
 ) -> dict[str, Any] | None:
     records = query_whatsapp_records_any_time(
@@ -362,6 +401,8 @@ def query_latest_whatsapp_record(
         destination_context_type=destination_context_type,
         group_chat_id=group_chat_id,
         dm_counterparty_id=dm_counterparty_id,
+        continuity_scope_id=continuity_scope_id,
+        continuity_scope_kind=continuity_scope_kind,
         direction=direction,
     )
     if not records:

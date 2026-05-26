@@ -43,6 +43,16 @@ _OUTREACH_PREFIXES = (
 WHATSAPP_OUTREACH_STATE_SCHEMA_VERSION = 1
 WHATSAPP_OUTREACH_PLAN_WORKFLOW_BINDING_TYPE = "whatsapp_outreach_plan"
 WHATSAPP_DEFAULT_COMMUNICATION_SKILL_NAME = "whatsapp-communications"
+WHATSAPP_PRODUCTION_CONTINUITY_SCOPE_KIND = "production"
+WHATSAPP_COLD_START_VALIDATION_CONTINUITY_SCOPE_KIND = "cold_start_validation"
+WHATSAPP_COLD_START_VALIDATION_MODE_NONE = "none"
+WHATSAPP_COLD_START_VALIDATION_MODE_NON_DESTRUCTIVE_ISOLATION = (
+    "non_destructive_isolation"
+)
+WHATSAPP_CONTINUITY_SCOPE_STATUS_PREPARED = "prepared"
+WHATSAPP_FRESHNESS_BASIS_PRESERVED_HISTORY_AVAILABLE = "preserved_history_available"
+WHATSAPP_FRESHNESS_BASIS_NATURAL_NO_PRIOR_HISTORY = "natural_no_prior_history"
+WHATSAPP_FRESHNESS_BASIS_EXPLICIT_VALIDATION_ISOLATION = "explicit_validation_isolation"
 WHATSAPP_ALLOWED_COMMUNICATION_STAGES = (
     "opening_outreach",
     "follow_up",
@@ -236,6 +246,7 @@ def _default_outreach_state() -> dict[str, Any]:
         "schema_version": WHATSAPP_OUTREACH_STATE_SCHEMA_VERSION,
         "plans": [],
         "plan_targets": [],
+        "continuity_scopes": [],
         "runs": [],
         "target_executions": [],
         "reports": [],
@@ -251,7 +262,14 @@ def _normalized_outreach_state(raw_state: dict[str, Any] | None) -> dict[str, An
     if isinstance(schema_version, int) and schema_version > 0:
         state["schema_version"] = schema_version
 
-    for field in ("plans", "plan_targets", "runs", "target_executions", "reports"):
+    for field in (
+        "plans",
+        "plan_targets",
+        "continuity_scopes",
+        "runs",
+        "target_executions",
+        "reports",
+    ):
         value = raw_state.get(field)
         if isinstance(value, list):
             state[field] = [item for item in value if isinstance(item, dict)]
@@ -301,6 +319,313 @@ def _exact_selector_from_row(row: dict[str, Any]) -> dict[str, Any]:
         field: (str(row.get(field) or "").strip() or None)
         for field in WHATSAPP_APPROVED_OUTREACH_EXACT_SELECTOR_FIELDS
     }
+
+
+def _resolved_production_scope_for_target(
+    state: dict[str, Any], plan_target_row: dict[str, Any]
+) -> dict[str, Any]:
+    default_scope_id = _json_safe_string(
+        plan_target_row.get("default_continuity_scope_id")
+    )
+    if default_scope_id:
+        scope_row = _find_first(
+            state["continuity_scopes"],
+            "continuity_scope_id",
+            default_scope_id,
+        )
+        if (
+            scope_row is not None
+            and scope_row.get("continuity_scope_kind")
+            == WHATSAPP_PRODUCTION_CONTINUITY_SCOPE_KIND
+        ):
+            return scope_row
+
+    target_destination_key = _json_safe_string(plan_target_row.get("destination_key"))
+    target_dm_counterparty_id = _json_safe_string(
+        plan_target_row.get("dm_counterparty_id")
+    )
+    for scope_row in state["continuity_scopes"]:
+        if scope_row.get("plan_target_id") != plan_target_row.get("plan_target_id"):
+            continue
+        if (
+            scope_row.get("continuity_scope_kind")
+            != WHATSAPP_PRODUCTION_CONTINUITY_SCOPE_KIND
+        ):
+            continue
+        if (
+            target_destination_key
+            and scope_row.get("target_destination_key") != target_destination_key
+        ):
+            continue
+        if (
+            target_dm_counterparty_id
+            and scope_row.get("target_dm_counterparty_id") != target_dm_counterparty_id
+        ):
+            continue
+        return scope_row
+
+    continuity_scope_id = f"wascope-{uuid4()}"
+    created_at_utc = utc_isoformat(utc_now())
+    scope_row = {
+        "continuity_scope_id": continuity_scope_id,
+        "plan_target_id": plan_target_row["plan_target_id"],
+        "continuity_scope_kind": WHATSAPP_PRODUCTION_CONTINUITY_SCOPE_KIND,
+        "cold_start_validation_mode": WHATSAPP_COLD_START_VALIDATION_MODE_NONE,
+        "scope_status": "active",
+        "target_destination_key": target_destination_key,
+        "target_dm_counterparty_id": target_dm_counterparty_id,
+        "approved_destination_chat_id_snapshot": _json_safe_string(
+            plan_target_row.get("approved_destination_chat_id")
+        ),
+        "created_by_principal": (
+            _json_safe_string(plan_target_row.get("approved_by_principal"))
+            or "owner_operator"
+        ),
+        "created_at_utc": created_at_utc,
+        "operator_reason": "implicit production continuity scope",
+        "replaced_continuity_scope_id": None,
+        "consumed_by_run_id": None,
+        "destructive_confirmation_at_utc": None,
+        "destructive_confirmed_by_principal": None,
+    }
+    state["continuity_scopes"].append(scope_row)
+    plan_target_row["default_continuity_scope_id"] = continuity_scope_id
+    return scope_row
+
+
+def _continuity_scope_result(
+    *,
+    workflow_status: str,
+    continuity_scope: dict[str, Any] | None = None,
+    founder_summary: str = "",
+    reason: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "workflow_status": workflow_status,
+        "continuity_scope": continuity_scope,
+        "founder_summary": founder_summary,
+        "reason": reason,
+    }
+
+
+def prepare_whatsapp_cold_start_validation(
+    request: dict[str, Any] | None,
+    *,
+    authorized: bool,
+    created_by_principal: str,
+) -> dict[str, Any]:
+    if not authorized:
+        return _continuity_scope_result(
+            workflow_status="forbidden",
+            founder_summary=(
+                "WhatsApp cold-start validation stayed blocked because this request was not owner-authorized."
+            ),
+            reason="owner authorization required",
+        )
+
+    raw_request = request or {}
+    cold_start_validation_mode = _json_safe_string(
+        raw_request.get("cold_start_validation_mode")
+    )
+    if (
+        cold_start_validation_mode
+        != WHATSAPP_COLD_START_VALIDATION_MODE_NON_DESTRUCTIVE_ISOLATION
+    ):
+        reason = (
+            "cold_start_validation_mode must be non_destructive_isolation"
+            if cold_start_validation_mode
+            else "cold_start_validation_mode is required"
+        )
+        return _continuity_scope_result(
+            workflow_status="invalid_request",
+            founder_summary=(
+                "WhatsApp cold-start validation could not prepare because the requested validation mode is unsupported in this slice."
+            ),
+            reason=reason,
+        )
+
+    operator_reason = _json_safe_string(raw_request.get("operator_reason"))
+    if not operator_reason:
+        return _continuity_scope_result(
+            workflow_status="invalid_request",
+            founder_summary=(
+                "WhatsApp cold-start validation could not prepare because the operator reason was missing."
+            ),
+            reason="operator_reason is required",
+        )
+
+    approved_destination_chat_id = _json_safe_string(
+        raw_request.get("approved_destination_chat_id")
+    )
+    selector = {
+        field: _json_safe_string(raw_request.get(field))
+        for field in WHATSAPP_APPROVED_OUTREACH_EXACT_SELECTOR_FIELDS
+    }
+    selected_fields = [field for field, value in selector.items() if value]
+    if approved_destination_chat_id and selected_fields:
+        return _continuity_scope_result(
+            workflow_status="invalid_request",
+            founder_summary=(
+                "WhatsApp cold-start validation could not prepare because the request mixed preserved-thread selectors with a cold-start DM target."
+            ),
+            reason="prepare requires exactly one target basis",
+        )
+    if not approved_destination_chat_id and len(selected_fields) != 1:
+        return _continuity_scope_result(
+            workflow_status="invalid_request",
+            founder_summary=(
+                "WhatsApp cold-start validation could not prepare because the request did not provide one exact approved DM target."
+            ),
+            reason="prepare requires exactly one exact target",
+        )
+
+    with _OUTREACH_STATE_LOCK:
+        state = load_whatsapp_outreach_state()
+        matched_targets: list[dict[str, Any]] = []
+
+        for plan_target_row in state["plan_targets"]:
+            if plan_target_row.get("target_status") != "active":
+                continue
+            plan_row = _find_first(
+                state["plans"], "plan_id", plan_target_row.get("plan_id")
+            )
+            if plan_row is None:
+                continue
+            if plan_row.get("plan_status") not in {"approved", "active"}:
+                continue
+
+            target_destination_key = _json_safe_string(
+                plan_target_row.get("destination_key")
+            )
+            target_dm_counterparty_id = _json_safe_string(
+                plan_target_row.get("dm_counterparty_id")
+            )
+            target_group_chat_id = _json_safe_string(
+                plan_target_row.get("group_chat_id")
+            )
+            target_approved_destination_chat_id = _json_safe_string(
+                plan_target_row.get("approved_destination_chat_id")
+            )
+
+            if target_group_chat_id:
+                continue
+
+            if approved_destination_chat_id is not None:
+                normalized_fields = build_whatsapp_destination_fields(
+                    approved_destination_chat_id
+                )
+                if (
+                    normalized_fields.get("destination_context_type")
+                    != "direct_message"
+                ):
+                    return _continuity_scope_result(
+                        workflow_status="invalid_request",
+                        founder_summary=(
+                            "WhatsApp cold-start validation could not prepare because only one exact approved DM target is supported in this slice."
+                        ),
+                        reason=(
+                            "approved target must be one exact direct-message destination"
+                        ),
+                    )
+                canonical_destination_key = _json_safe_string(
+                    normalized_fields.get("destination_key")
+                )
+                canonical_dm_counterparty_id = _json_safe_string(
+                    normalized_fields.get("dm_counterparty_id")
+                )
+                if target_destination_key != canonical_destination_key:
+                    continue
+                if target_dm_counterparty_id != canonical_dm_counterparty_id:
+                    continue
+                if (
+                    target_approved_destination_chat_id
+                    and target_approved_destination_chat_id
+                    != approved_destination_chat_id
+                ):
+                    continue
+            else:
+                selector_field = selected_fields[0]
+                if selector_field == "group_chat_id":
+                    return _continuity_scope_result(
+                        workflow_status="invalid_request",
+                        founder_summary=(
+                            "WhatsApp cold-start validation could not prepare because v1 validation is direct-message only."
+                        ),
+                        reason="group targets are unsupported for cold-start validation",
+                    )
+                if plan_target_row.get(selector_field) != selector.get(selector_field):
+                    continue
+
+            matched_targets.append(plan_target_row)
+
+        if not matched_targets:
+            return _continuity_scope_result(
+                workflow_status="blocked",
+                founder_summary=(
+                    "WhatsApp cold-start validation stayed blocked because the exact approved DM target could not be found."
+                ),
+                reason="exact approved DM target not found",
+            )
+        if len(matched_targets) != 1:
+            return _continuity_scope_result(
+                workflow_status="blocked",
+                founder_summary=(
+                    "WhatsApp cold-start validation stayed blocked because the request resolved to more than one approved target."
+                ),
+                reason="exact approved DM target is ambiguous",
+            )
+
+        plan_target_row = matched_targets[0]
+        destination_key = _json_safe_string(plan_target_row.get("destination_key"))
+        dm_counterparty_id = _json_safe_string(
+            plan_target_row.get("dm_counterparty_id")
+        )
+        if not destination_key or not dm_counterparty_id:
+            return _continuity_scope_result(
+                workflow_status="blocked",
+                founder_summary=(
+                    "WhatsApp cold-start validation stayed blocked because the exact approved target is not a canonical DM target."
+                ),
+                reason=(
+                    "exact approved DM target requires canonical destination_key and dm_counterparty_id"
+                ),
+            )
+
+        production_scope = _resolved_production_scope_for_target(state, plan_target_row)
+        created_at_utc = utc_isoformat(utc_now())
+        continuity_scope = {
+            "continuity_scope_id": f"wascope-{uuid4()}",
+            "plan_target_id": plan_target_row["plan_target_id"],
+            "continuity_scope_kind": WHATSAPP_COLD_START_VALIDATION_CONTINUITY_SCOPE_KIND,
+            "cold_start_validation_mode": (
+                WHATSAPP_COLD_START_VALIDATION_MODE_NON_DESTRUCTIVE_ISOLATION
+            ),
+            "scope_status": WHATSAPP_CONTINUITY_SCOPE_STATUS_PREPARED,
+            "target_destination_key": destination_key,
+            "target_dm_counterparty_id": dm_counterparty_id,
+            "approved_destination_chat_id_snapshot": approved_destination_chat_id
+            or _json_safe_string(plan_target_row.get("approved_destination_chat_id")),
+            "created_by_principal": created_by_principal,
+            "created_at_utc": created_at_utc,
+            "operator_reason": operator_reason,
+            "replaced_continuity_scope_id": None,
+            "consumed_by_run_id": None,
+            "destructive_confirmation_at_utc": None,
+            "destructive_confirmed_by_principal": None,
+        }
+        state["continuity_scopes"].append(continuity_scope)
+        plan_target_row["default_continuity_scope_id"] = production_scope[
+            "continuity_scope_id"
+        ]
+        _write_whatsapp_outreach_state(state)
+
+    return _continuity_scope_result(
+        workflow_status="prepared",
+        continuity_scope=dict(continuity_scope),
+        founder_summary=(
+            "WhatsApp cold-start validation prepared one exact approved DM target with a non-destructive isolated continuity scope while leaving production continuity unchanged."
+        ),
+    )
 
 
 def _resolved_target_from_execution(execution: dict[str, Any]) -> dict[str, Any]:
@@ -699,6 +1024,8 @@ def _persist_cold_start_outbound_record(
     outbound_message_text: str,
     message_id: str | None,
     effective_event_at_utc: str,
+    continuity_scope_id: str | None = None,
+    continuity_scope_kind: str | None = None,
 ) -> None:
     effective_event_at = datetime.fromisoformat(
         effective_event_at_utc.replace("Z", "+00:00")
@@ -719,6 +1046,8 @@ def _persist_cold_start_outbound_record(
             "participant_role": "agent",
             "message_classification": "conversational_only",
             "command_authority_scope": "none",
+            "continuity_scope_id": continuity_scope_id,
+            "continuity_scope_kind": continuity_scope_kind,
             "sender_id": "agent",
             "sender_name": "Hermes",
             "text": outbound_message_text,
@@ -886,6 +1215,9 @@ def _persist_whatsapp_outreach_run_record(record: dict[str, Any]) -> Path:
         plan = record.get("plan") if isinstance(record, dict) else None
         run = record.get("run") if isinstance(record, dict) else None
         report = record.get("report") if isinstance(record, dict) else None
+        continuity_scopes = (
+            record.get("continuity_scopes") if isinstance(record, dict) else None
+        )
         if isinstance(plan, dict):
             plan_targets = plan.get("approved_targets") or []
             state["plans"] = [
@@ -910,6 +1242,20 @@ def _persist_whatsapp_outreach_run_record(record: dict[str, Any]) -> Path:
                 state["plan_targets"].extend(
                     dict(target) for target in plan_targets if isinstance(target, dict)
                 )
+        if isinstance(continuity_scopes, list):
+            continuity_scope_ids = {
+                scope.get("continuity_scope_id")
+                for scope in continuity_scopes
+                if isinstance(scope, dict)
+            }
+            state["continuity_scopes"] = [
+                row
+                for row in state["continuity_scopes"]
+                if row.get("continuity_scope_id") not in continuity_scope_ids
+            ]
+            state["continuity_scopes"].extend(
+                dict(scope) for scope in continuity_scopes if isinstance(scope, dict)
+            )
         if isinstance(run, dict):
             target_executions = run.get("target_executions") or []
             state["runs"] = [
@@ -1286,6 +1632,9 @@ async def execute_whatsapp_approved_outreach(
         ]
         state["plans"].append(dict(plan_row))
         for plan_target_row in plan_targets:
+            production_scope_row = _resolved_production_scope_for_target(
+                state, plan_target_row
+            )
             state["plan_targets"] = [
                 row
                 for row in state["plan_targets"]
@@ -1297,6 +1646,15 @@ async def execute_whatsapp_approved_outreach(
                 "run_id": run_id,
                 "plan_target_id": plan_target_row["plan_target_id"],
                 "execution_status": "queued",
+                "continuity_scope_id": production_scope_row.get("continuity_scope_id"),
+                "continuity_scope_kind": production_scope_row.get(
+                    "continuity_scope_kind"
+                )
+                or WHATSAPP_PRODUCTION_CONTINUITY_SCOPE_KIND,
+                "cold_start_validation_mode": production_scope_row.get(
+                    "cold_start_validation_mode"
+                )
+                or WHATSAPP_COLD_START_VALIDATION_MODE_NONE,
                 "resolved_conversation_key": None,
                 "resolved_destination_key": None,
                 "resolved_destination_chat_id": None,
@@ -1319,6 +1677,7 @@ async def execute_whatsapp_approved_outreach(
                 "draft_outcome": None,
                 "outbound_message_text": None,
                 "handoff_reason": None,
+                "freshness_basis": None,
                 "dispatch_group_id": None,
                 "message_id": None,
                 "last_error": None,
@@ -1348,6 +1707,15 @@ async def execute_whatsapp_approved_outreach(
         approved_destination_chat_id = _json_safe_string(
             plan_target_row.get("approved_destination_chat_id")
         )
+        continuity_scope_id = _json_safe_string(execution.get("continuity_scope_id"))
+        continuity_scope_kind = (
+            _json_safe_string(execution.get("continuity_scope_kind"))
+            or WHATSAPP_PRODUCTION_CONTINUITY_SCOPE_KIND
+        )
+        cold_start_validation_mode = (
+            _json_safe_string(execution.get("cold_start_validation_mode"))
+            or WHATSAPP_COLD_START_VALIDATION_MODE_NONE
+        )
         target_resolution_source = (
             _json_safe_string(plan_target_row.get("target_resolution_source"))
             or "preserved_history"
@@ -1364,12 +1732,21 @@ async def execute_whatsapp_approved_outreach(
             if cold_start_error:
                 execution.update({
                     "execution_status": "blocked",
+                    "continuity_scope_id": continuity_scope_id,
+                    "continuity_scope_kind": continuity_scope_kind,
+                    "cold_start_validation_mode": cold_start_validation_mode,
                     "last_error": cold_start_error,
                     "continuity_mode": continuity_mode
                     or "cold_start_pending_first_send",
                     "target_resolution_source": "approved_destination_chat_id",
                     "approved_destination_chat_id_snapshot": approved_destination_chat_id,
                     "had_prior_preserved_thread": False,
+                    "freshness_basis": (
+                        WHATSAPP_FRESHNESS_BASIS_EXPLICIT_VALIDATION_ISOLATION
+                        if continuity_scope_kind
+                        == WHATSAPP_COLD_START_VALIDATION_CONTINUITY_SCOPE_KIND
+                        else WHATSAPP_FRESHNESS_BASIS_NATURAL_NO_PRIOR_HISTORY
+                    ),
                 })
                 target_rows.append({
                     "plan_target_id": plan_target_row["plan_target_id"],
@@ -1392,6 +1769,9 @@ async def execute_whatsapp_approved_outreach(
                     },
                     "continuity_mode": "cold_start_pending_first_send",
                     "had_prior_preserved_thread": False,
+                    "continuity_scope_kind": continuity_scope_kind,
+                    "cold_start_validation_mode": cold_start_validation_mode,
+                    "freshness_basis": execution.get("freshness_basis"),
                     "observable_status": "unresolved",
                     "status_basis": "direct_conversation_evidence",
                     "latest_observed_message_at_utc": None,
@@ -1442,6 +1822,14 @@ async def execute_whatsapp_approved_outreach(
                     "destination_chat_id": None,
                     "destination_target_id": None,
                 },
+                "continuity_scope_kind": continuity_scope_kind,
+                "cold_start_validation_mode": cold_start_validation_mode,
+                "freshness_basis": (
+                    WHATSAPP_FRESHNESS_BASIS_EXPLICIT_VALIDATION_ISOLATION
+                    if continuity_scope_kind
+                    == WHATSAPP_COLD_START_VALIDATION_CONTINUITY_SCOPE_KIND
+                    else WHATSAPP_FRESHNESS_BASIS_PRESERVED_HISTORY_AVAILABLE
+                ),
                 "observable_status": "unresolved",
                 "status_basis": "direct_conversation_evidence",
                 "latest_observed_message_at_utc": None,
@@ -1462,6 +1850,8 @@ async def execute_whatsapp_approved_outreach(
                 ),
                 group_chat_id=resolved_target.get("group_chat_id"),
                 dm_counterparty_id=resolved_target.get("dm_counterparty_id"),
+                continuity_scope_id=continuity_scope_id,
+                continuity_scope_kind=continuity_scope_kind,
             )
             history_window_start_utc = (
                 continuity_rows[0].get("effective_event_at_utc")
@@ -1500,6 +1890,9 @@ async def execute_whatsapp_approved_outreach(
         })
         execution.update({
             "execution_status": "resolved",
+            "continuity_scope_id": continuity_scope_id,
+            "continuity_scope_kind": continuity_scope_kind,
+            "cold_start_validation_mode": cold_start_validation_mode,
             "resolved_conversation_key": resolved_target.get("conversation_key"),
             "resolved_destination_key": resolved_target.get("destination_key"),
             "resolved_destination_chat_id": resolved_target.get("destination_chat_id"),
@@ -1520,6 +1913,19 @@ async def execute_whatsapp_approved_outreach(
             "approved_destination_chat_id_snapshot": approved_destination_chat_id,
             "had_prior_preserved_thread": target_resolution_source
             != "approved_destination_chat_id",
+            "freshness_basis": (
+                WHATSAPP_FRESHNESS_BASIS_EXPLICIT_VALIDATION_ISOLATION
+                if continuity_scope_kind
+                == WHATSAPP_COLD_START_VALIDATION_CONTINUITY_SCOPE_KIND
+                else WHATSAPP_FRESHNESS_BASIS_PRESERVED_HISTORY_AVAILABLE
+            )
+            if target_resolution_source != "approved_destination_chat_id"
+            else (
+                WHATSAPP_FRESHNESS_BASIS_EXPLICIT_VALIDATION_ISOLATION
+                if continuity_scope_kind
+                == WHATSAPP_COLD_START_VALIDATION_CONTINUITY_SCOPE_KIND
+                else WHATSAPP_FRESHNESS_BASIS_NATURAL_NO_PRIOR_HISTORY
+            ),
             "communication_skill_name": plan_row["communication_skill_name"],
             "last_error": None,
         })
@@ -1604,6 +2010,8 @@ async def execute_whatsapp_approved_outreach(
                 outbound_message_text=str(execution.get("outbound_message_text")),
                 message_id=_json_safe_string(execution.get("message_id")),
                 effective_event_at_utc=str(cold_start_event_at_utc),
+                continuity_scope_id=continuity_scope_id,
+                continuity_scope_kind=continuity_scope_kind,
             )
             persisted_fields = build_whatsapp_destination_fields(
                 str(execution.get("approved_destination_chat_id_snapshot") or "")
@@ -1688,6 +2096,9 @@ async def execute_whatsapp_approved_outreach(
             "resolved_target": resolved_target,
             "continuity_mode": execution.get("continuity_mode"),
             "had_prior_preserved_thread": execution.get("had_prior_preserved_thread"),
+            "continuity_scope_kind": execution.get("continuity_scope_kind"),
+            "cold_start_validation_mode": execution.get("cold_start_validation_mode"),
+            "freshness_basis": execution.get("freshness_basis"),
             "observable_status": observable_status,
             "status_basis": _status_basis_for_observable_status(observable_status),
             "latest_observed_message_at_utc": history_window_end_utc,
@@ -1920,6 +2331,32 @@ def format_whatsapp_approved_outreach_result(result: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def format_whatsapp_cold_start_validation_result(result: dict[str, Any]) -> str:
+    lines = [
+        "WhatsApp cold-start validation",
+        f"Status: {result.get('workflow_status', 'invalid_request')}",
+    ]
+    continuity_scope = result.get("continuity_scope") or {}
+    if continuity_scope:
+        lines.extend([
+            f"continuity_scope_id: {continuity_scope.get('continuity_scope_id')}",
+            f"continuity_scope_kind: {continuity_scope.get('continuity_scope_kind')}",
+            f"cold_start_validation_mode: {continuity_scope.get('cold_start_validation_mode')}",
+            f"plan_target_id: {continuity_scope.get('plan_target_id')}",
+            f"target_destination_key: {continuity_scope.get('target_destination_key')}",
+            f"target_dm_counterparty_id: {continuity_scope.get('target_dm_counterparty_id')}",
+            f"approved_destination_chat_id_snapshot: {continuity_scope.get('approved_destination_chat_id_snapshot')}",
+            f"created_by_principal: {continuity_scope.get('created_by_principal')}",
+            f"operator_reason: {continuity_scope.get('operator_reason')}",
+            f"created_at_utc: {continuity_scope.get('created_at_utc')}",
+        ])
+    if result.get("reason"):
+        lines.append(f"Reason: {result['reason']}")
+    if result.get("founder_summary"):
+        lines.extend(["", result["founder_summary"]])
+    return "\n".join(lines)
+
+
 __all__ = [
     "WHATSAPP_APPROVED_OUTREACH_ALLOWED_FIELDS",
     "WHATSAPP_APPROVED_OUTREACH_EXACT_SELECTOR_FIELDS",
@@ -1930,11 +2367,13 @@ __all__ = [
     "bind_whatsapp_outreach_plan_to_cron_job",
     "execute_whatsapp_approved_outreach",
     "format_whatsapp_approved_outreach_result",
+    "format_whatsapp_cold_start_validation_result",
     "is_whatsapp_approved_outreach_instruction",
     "load_whatsapp_outreach_state",
     "load_whatsapp_outreach_run_records",
     "normalize_whatsapp_approved_outreach_request",
     "parse_whatsapp_approved_outreach_instruction",
+    "prepare_whatsapp_cold_start_validation",
     "sync_whatsapp_outreach_plan_cron_bindings",
     "unbind_whatsapp_outreach_plan_from_cron_job",
 ]

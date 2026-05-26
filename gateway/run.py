@@ -2989,7 +2989,11 @@ class GatewayRunner:
         mode = os.getenv("HERMES_GATEWAY_BUSY_TEXT_MODE", "").strip().lower()
         if not mode:
             cfg = _load_gateway_runtime_config()
-            mode = str(cfg_get(cfg, "display", "busy_text_mode", default="") or "").strip().lower()
+            mode = (
+                str(cfg_get(cfg, "display", "busy_text_mode", default="") or "")
+                .strip()
+                .lower()
+            )
         if mode == "interrupt":
             return "interrupt"
         return "queue"
@@ -5935,7 +5939,9 @@ class GatewayRunner:
                     adapter.set_message_handler(self._handle_message)
                     adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
                     adapter.set_session_store(self.session_store)
-                    adapter.set_busy_session_handler(self._handle_active_session_busy_message)
+                    adapter.set_busy_session_handler(
+                        self._handle_active_session_busy_message
+                    )
                     adapter._busy_text_mode = self._busy_text_mode
 
                     success = await self._connect_adapter_with_timeout(
@@ -14053,6 +14059,25 @@ class GatewayRunner:
         )
         return format_whatsapp_approved_outreach_result(result)
 
+    async def _handle_whatsapp_cold_start_validation_prepare(
+        self,
+        request: dict[str, Any],
+        *,
+        authorized: bool,
+        created_by_principal: str = "owner_operator",
+    ) -> str:
+        from gateway.whatsapp_approved_outreach import (
+            format_whatsapp_cold_start_validation_result,
+            prepare_whatsapp_cold_start_validation,
+        )
+
+        result = prepare_whatsapp_cold_start_validation(
+            request,
+            authorized=authorized,
+            created_by_principal=created_by_principal,
+        )
+        return format_whatsapp_cold_start_validation_result(result)
+
     async def _handle_resume_command(self, event: MessageEvent) -> str:
         """Handle /resume command — switch to a previously-named session."""
         if not self._session_db:
@@ -19567,8 +19592,10 @@ class GatewayRunner:
             # after streaming finished — when the response was transformed, always
             # send the final version so the appended content reaches the client.
             _transformed = bool(response.get("response_transformed"))
-            if not _is_empty_sentinel and not _transformed and (
-                _streamed or _previewed or _content_delivered
+            if (
+                not _is_empty_sentinel
+                and not _transformed
+                and (_streamed or _previewed or _content_delivered)
             ):
                 logger.info(
                     "Suppressing normal final send for session %s: final delivery already confirmed (streamed=%s previewed=%s content_delivered=%s).",
@@ -19593,12 +19620,14 @@ class GatewayRunner:
                         response["already_sent"] = True
                         logger.info(
                             "Edited streamed message %s for session %s to include plugin-transformed content.",
-                            _sc_msg_id, session_key or "?",
+                            _sc_msg_id,
+                            session_key or "?",
                         )
                     except Exception as _edit_err:
                         logger.warning(
                             "Failed to edit streamed message for session %s: %s",
-                            session_key or "?", _edit_err,
+                            session_key or "?",
+                            _edit_err,
                         )
 
         # Schedule deletion of tracked temporary progress bubbles after the
