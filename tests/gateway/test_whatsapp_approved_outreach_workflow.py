@@ -156,6 +156,46 @@ def _append_record(
     )
 
 
+async def _run_stage_selection_case(
+    tmp_path,
+    monkeypatch,
+    history_rows: list[dict[str, str]],
+) -> dict[str, str | None]:
+    hermes_home = tmp_path / ".hermes"
+    base_dir = hermes_home / "gateway" / "whatsapp-records"
+    base_dir.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    for index, row in enumerate(history_rows, start=1):
+        _append_record(
+            base_dir,
+            record_id=f"record-{index}",
+            text=row["text"],
+            participant_role=row["participant_role"],
+            message_id=f"msg-{index}",
+            effective_event_at=f"2024-06-02T09:0{index}:00Z",
+        )
+
+    runner = _make_runner(tmp_path)
+    runner.adapters[Platform.WHATSAPP].send = AsyncMock(
+        return_value=SendResult(
+            success=True,
+            message_id="bridge-msg-stage",
+            raw_response={"dispatch_group_id": "dispatch-stage"},
+        )
+    )
+
+    await runner._handle_message(
+        _make_event(
+            "whatsapp outreach destination_key=whatsapp:dm:15551230000 "
+            'operator_objective="request the revised quote" '
+            'message_text="Following up on the revised quote."'
+        )
+    )
+
+    return load_whatsapp_outreach_state()["target_executions"][0]
+
+
 @pytest.mark.asyncio
 async def test_instruction_triggered_outreach_sends_one_bounded_follow_up(
     tmp_path, monkeypatch
@@ -258,7 +298,9 @@ async def test_instruction_triggered_outreach_sends_one_bounded_follow_up(
     assert execution_row["execution_status"] == "sent"
     assert execution_row["message_generation_mode"] == "operator_text_override"
     assert execution_row["draft_outcome"] == "send_message"
-    assert execution_row["outbound_message_text"] == "Following up on the revised quote."
+    assert (
+        execution_row["outbound_message_text"] == "Following up on the revised quote."
+    )
     assert execution_row["resolved_conversation_key"] == "whatsapp:dm:15551230000"
     assert execution_row["resolved_destination_key"] == "whatsapp:dm:15551230000"
     assert execution_row["resolved_destination_chat_id"] == "15551230000@s.whatsapp.net"
@@ -544,6 +586,127 @@ async def test_instruction_triggered_outreach_can_require_handoff_from_skill(
     assert execution_row["draft_outcome"] == "handoff_required"
     assert execution_row["outbound_message_text"] is None
     assert execution_row["handoff_reason"] == "pricing requires owner review"
+
+    state = load_whatsapp_outreach_state()
+    assert state["runs"][0]["run_status"] == "blocked"
+    assert state["reports"][0]["report_status"] == "partial"
+    assert (
+        state["reports"][0]["target_rows"][0]["observable_status"] == "handoff_required"
+    )
+    assert (
+        state["reports"][0]["target_rows"][0]["handoff_reason"]
+        == "pricing requires owner review"
+    )
+
+
+@pytest.mark.asyncio
+async def test_stage_selection_uses_opening_outreach_when_no_prior_agent_message(
+    tmp_path, monkeypatch
+):
+    execution_row = await _run_stage_selection_case(
+        tmp_path,
+        monkeypatch,
+        [
+            {
+                "participant_role": "external_party",
+                "text": "Checking in about the project.",
+            }
+        ],
+    )
+
+    assert execution_row["communication_stage"] == "opening_outreach"
+
+
+@pytest.mark.asyncio
+async def test_stage_selection_uses_follow_up_when_prior_agent_message_has_no_unresolved_external_turn(
+    tmp_path, monkeypatch
+):
+    execution_row = await _run_stage_selection_case(
+        tmp_path,
+        monkeypatch,
+        [
+            {
+                "participant_role": "external_party",
+                "text": "Checking in about the project.",
+            },
+            {"participant_role": "agent", "text": "Thanks, I will follow up shortly."},
+        ],
+    )
+
+    assert execution_row["communication_stage"] == "follow_up"
+
+
+@pytest.mark.asyncio
+async def test_stage_selection_uses_clarification_for_unresolved_external_question(
+    tmp_path, monkeypatch
+):
+    execution_row = await _run_stage_selection_case(
+        tmp_path,
+        monkeypatch,
+        [
+            {"participant_role": "agent", "text": "I can help with the quote."},
+            {
+                "participant_role": "external_party",
+                "text": "What delivery date can you commit to?",
+            },
+        ],
+    )
+
+    assert execution_row["communication_stage"] == "clarification"
+
+
+@pytest.mark.asyncio
+async def test_stage_selection_uses_negotiation_for_unresolved_external_term_turn(
+    tmp_path, monkeypatch
+):
+    execution_row = await _run_stage_selection_case(
+        tmp_path,
+        monkeypatch,
+        [
+            {"participant_role": "agent", "text": "I can help with the quote."},
+            {
+                "participant_role": "external_party",
+                "text": "Can you do $500 and include payment terms?",
+            },
+        ],
+    )
+
+    assert execution_row["communication_stage"] == "negotiation"
+
+
+@pytest.mark.asyncio
+async def test_stage_selection_uses_closeout_for_unresolved_external_acceptance(
+    tmp_path, monkeypatch
+):
+    execution_row = await _run_stage_selection_case(
+        tmp_path,
+        monkeypatch,
+        [
+            {"participant_role": "agent", "text": "I can help with the quote."},
+            {"participant_role": "external_party", "text": "We accept. Let's proceed."},
+        ],
+    )
+
+    assert execution_row["communication_stage"] == "closeout"
+
+
+@pytest.mark.asyncio
+async def test_stage_selection_prefers_negotiation_over_clarification_for_mixed_turn(
+    tmp_path, monkeypatch
+):
+    execution_row = await _run_stage_selection_case(
+        tmp_path,
+        monkeypatch,
+        [
+            {"participant_role": "agent", "text": "I can help with the quote."},
+            {
+                "participant_role": "external_party",
+                "text": "What is the best price you can offer and what payment terms apply?",
+            },
+        ],
+    )
+
+    assert execution_row["communication_stage"] == "negotiation"
 
 
 @pytest.mark.asyncio
