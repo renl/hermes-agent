@@ -40,9 +40,27 @@ _OUTREACH_PREFIXES = (
     "whatsapp outreach",
     "whatsapp-outreach",
 )
+_LOCAL_GOVERNANCE_PREFIXES = (
+    "whatsapp start",
+    "whatsapp revise",
+    "whatsapp conversation start",
+    "whatsapp conversation revise",
+)
 WHATSAPP_OUTREACH_STATE_SCHEMA_VERSION = 1
 WHATSAPP_OUTREACH_PLAN_WORKFLOW_BINDING_TYPE = "whatsapp_outreach_plan"
 WHATSAPP_DEFAULT_COMMUNICATION_SKILL_NAME = "whatsapp-communications"
+WHATSAPP_ALLOWED_OPERATOR_INGRESS_SURFACES = (
+    "cli_chat",
+    "tui_chat",
+    "dashboard_chat",
+)
+WHATSAPP_ALLOWED_INTERACTION_LANES = (
+    "external_conversation",
+    "operator_governance",
+    "admin_debug_report",
+)
+WHATSAPP_CONVERSATION_CHANNEL_MODE = "conversational_primary"
+WHATSAPP_OPERATOR_GOVERNANCE_POLICY = "owner_approved_conversation"
 WHATSAPP_ALLOWED_COMMUNICATION_STAGES = (
     "opening_outreach",
     "follow_up",
@@ -60,28 +78,58 @@ _JSON_PRIMITIVE_TYPES = (str, int, float, bool, type(None))
 _OUTREACH_STATE_LOCK = threading.Lock()
 
 
-def build_cli_chat_whatsapp_outreach_requests(
+def build_local_chat_whatsapp_outreach_requests(
     text: str | None,
     *,
     session_id: str | None,
+    operator_ingress_surface: str,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     parsed_request = parse_whatsapp_approved_outreach_instruction(text)
     normalized_instruction = normalize_whatsapp_approved_outreach_request({
         **parsed_request,
         "trigger_source": "owner_instruction",
         "trigger_reference_id": session_id,
-        "operator_ingress_surface": "cli_chat",
+        "operator_ingress_surface": operator_ingress_surface,
+        "interaction_lane": "operator_governance",
+        "conversation_channel_mode": WHATSAPP_CONVERSATION_CHANNEL_MODE,
+        "operator_governance_policy": WHATSAPP_OPERATOR_GOVERNANCE_POLICY,
     })
     operator_instruction = dict(normalized_instruction)
     return operator_instruction, dict(operator_instruction)
 
 
-def is_whatsapp_approved_outreach_instruction(text: str | None) -> bool:
+def build_cli_chat_whatsapp_outreach_requests(
+    text: str | None,
+    *,
+    session_id: str | None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    return build_local_chat_whatsapp_outreach_requests(
+        text,
+        session_id=session_id,
+        operator_ingress_surface="cli_chat",
+    )
+
+
+def _matches_instruction_prefix(text: str | None, prefixes: tuple[str, ...]) -> bool:
     normalized = str(text or "").strip().lower()
     return any(
         normalized == prefix or normalized.startswith(f"{prefix} ")
-        for prefix in _OUTREACH_PREFIXES
+        for prefix in prefixes
     )
+
+
+def is_whatsapp_local_governance_instruction(text: str | None) -> bool:
+    return _matches_instruction_prefix(text, _LOCAL_GOVERNANCE_PREFIXES)
+
+
+def is_whatsapp_legacy_outreach_instruction(text: str | None) -> bool:
+    return _matches_instruction_prefix(text, _OUTREACH_PREFIXES)
+
+
+def is_whatsapp_approved_outreach_instruction(text: str | None) -> bool:
+    return is_whatsapp_local_governance_instruction(
+        text
+    ) or is_whatsapp_legacy_outreach_instruction(text)
 
 
 def parse_whatsapp_approved_outreach_instruction(text: str | None) -> dict[str, Any]:
@@ -90,7 +138,7 @@ def parse_whatsapp_approved_outreach_instruction(text: str | None) -> dict[str, 
     prefix = next(
         (
             candidate
-            for candidate in _OUTREACH_PREFIXES
+            for candidate in (*_LOCAL_GOVERNANCE_PREFIXES, *_OUTREACH_PREFIXES)
             if lowered == candidate or lowered.startswith(f"{candidate} ")
         ),
         None,
@@ -159,6 +207,32 @@ def normalize_whatsapp_approved_outreach_request(
     operator_ingress_surface = (
         str(raw_request.get("operator_ingress_surface") or "").strip() or None
     )
+    interaction_lane = str(raw_request.get("interaction_lane") or "").strip()
+    if not interaction_lane:
+        interaction_lane = "operator_governance"
+    if interaction_lane not in WHATSAPP_ALLOWED_INTERACTION_LANES:
+        raise ValueError(f"unsupported interaction_lane: {interaction_lane}")
+    conversation_channel_mode = (
+        str(raw_request.get("conversation_channel_mode") or "").strip()
+        or WHATSAPP_CONVERSATION_CHANNEL_MODE
+    )
+    if conversation_channel_mode != WHATSAPP_CONVERSATION_CHANNEL_MODE:
+        raise ValueError("conversation_channel_mode must be conversational_primary")
+    operator_governance_policy = (
+        str(raw_request.get("operator_governance_policy") or "").strip()
+        or WHATSAPP_OPERATOR_GOVERNANCE_POLICY
+    )
+    if operator_governance_policy != WHATSAPP_OPERATOR_GOVERNANCE_POLICY:
+        raise ValueError(
+            "operator_governance_policy must be owner_approved_conversation"
+        )
+    if (
+        operator_ingress_surface is not None
+        and operator_ingress_surface not in WHATSAPP_ALLOWED_OPERATOR_INGRESS_SURFACES
+    ):
+        raise ValueError(
+            f"unsupported operator_ingress_surface: {operator_ingress_surface}"
+        )
     if not trigger_source:
         trigger_source = "owner_instruction"
     return {
@@ -170,9 +244,74 @@ def normalize_whatsapp_approved_outreach_request(
         "trigger_source": trigger_source,
         "trigger_reference_id": trigger_reference_id,
         "operator_ingress_surface": operator_ingress_surface,
+        "interaction_lane": interaction_lane,
+        "conversation_channel_mode": conversation_channel_mode,
+        "operator_governance_policy": operator_governance_policy,
         "workflow_binding_type": workflow_binding_type or None,
         "workflow_binding_id": workflow_binding_id or None,
     }
+
+
+def _ensure_plan_contract_fields(plan_row: dict[str, Any]) -> dict[str, Any]:
+    plan_row["interaction_lane"] = "operator_governance"
+    plan_row["conversation_channel_mode"] = WHATSAPP_CONVERSATION_CHANNEL_MODE
+    plan_row["operator_governance_policy"] = WHATSAPP_OPERATOR_GOVERNANCE_POLICY
+    plan_row.setdefault("used_legacy_whatsapp_command_ingress", False)
+    return plan_row
+
+
+def _ensure_run_contract_fields(
+    run: dict[str, Any], *, plan: dict[str, Any]
+) -> dict[str, Any]:
+    run["interaction_lane"] = "operator_governance"
+    run["conversation_channel_mode"] = plan.get(
+        "conversation_channel_mode", WHATSAPP_CONVERSATION_CHANNEL_MODE
+    )
+    run["operator_governance_policy"] = plan.get(
+        "operator_governance_policy", WHATSAPP_OPERATOR_GOVERNANCE_POLICY
+    )
+    return run
+
+
+def _ensure_execution_contract_fields(execution: dict[str, Any]) -> dict[str, Any]:
+    execution["interaction_lane"] = "external_conversation"
+    return execution
+
+
+def _ensure_report_row_contract_fields(row: dict[str, Any]) -> dict[str, Any]:
+    row["interaction_lane"] = "external_conversation"
+    return row
+
+
+def _ensure_report_contract_fields(report: dict[str, Any]) -> dict[str, Any]:
+    report["interaction_lane"] = "admin_debug_report"
+    return report
+
+
+def _normalize_existing_outreach_row(row: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(row)
+    if (
+        normalized.get("report_status") is not None
+        or normalized.get("target_rows") is not None
+    ):
+        return _ensure_report_contract_fields(normalized)
+    if normalized.get("run_status") is not None:
+        plan_like = {
+            "conversation_channel_mode": normalized.get(
+                "conversation_channel_mode", WHATSAPP_CONVERSATION_CHANNEL_MODE
+            ),
+            "operator_governance_policy": normalized.get(
+                "operator_governance_policy", WHATSAPP_OPERATOR_GOVERNANCE_POLICY
+            ),
+        }
+        return _ensure_run_contract_fields(normalized, plan=plan_like)
+    if normalized.get("execution_status") is not None:
+        return _ensure_execution_contract_fields(normalized)
+    if normalized.get("plan_status") is not None:
+        return _ensure_plan_contract_fields(normalized)
+    if normalized.get("observable_status") is not None:
+        return _ensure_report_row_contract_fields(normalized)
+    return normalized
 
 
 def _outreach_store_path(*, base_dir: Path | None = None) -> Path:
@@ -254,7 +393,11 @@ def _normalized_outreach_state(raw_state: dict[str, Any] | None) -> dict[str, An
     for field in ("plans", "plan_targets", "runs", "target_executions", "reports"):
         value = raw_state.get(field)
         if isinstance(value, list):
-            state[field] = [item for item in value if isinstance(item, dict)]
+            state[field] = [
+                _normalize_existing_outreach_row(item)
+                for item in value
+                if isinstance(item, dict)
+            ]
     return state
 
 
@@ -383,7 +526,7 @@ def _enriched_plan(
 ) -> dict[str, Any] | None:
     if not isinstance(plan, dict):
         return None
-    enriched = dict(plan)
+    enriched = _ensure_plan_contract_fields(dict(plan))
     enriched["approved_targets"] = [
         dict(target)
         for target in state["plan_targets"]
@@ -393,7 +536,7 @@ def _enriched_plan(
 
 
 def _enriched_execution(execution: dict[str, Any]) -> dict[str, Any]:
-    enriched = dict(execution)
+    enriched = _ensure_execution_contract_fields(dict(execution))
     enriched["resolved_target"] = _resolved_target_from_execution(execution)
     return enriched
 
@@ -403,7 +546,8 @@ def _enriched_run(
 ) -> dict[str, Any] | None:
     if not isinstance(run, dict):
         return None
-    enriched = dict(run)
+    plan = _find_first(state["plans"], "plan_id", run.get("plan_id")) or {}
+    enriched = _ensure_run_contract_fields(dict(run), plan=plan)
     enriched["target_executions"] = [
         _enriched_execution(execution)
         for execution in state["target_executions"]
@@ -521,6 +665,27 @@ def _execution_summary_line(execution: dict[str, Any]) -> str:
     if error:
         return f"- {destination_label}: {status} ({error})"
     return f"- {destination_label}: {status}"
+
+
+def _founder_visible_ingress_summary(
+    *,
+    operator_ingress_surface: str | None,
+    interaction_lane: str | None,
+    used_legacy_whatsapp_command_ingress: bool,
+) -> str:
+    surface = operator_ingress_surface or "unknown"
+    lane = interaction_lane or "unknown"
+    if used_legacy_whatsapp_command_ingress:
+        return (
+            "Founder-visible ingress is now expected on Hermes-local governance surfaces; "
+            "this run used legacy WhatsApp command-shaped governance as a supporting path only. "
+            f"Recorded governance lane={lane}, operator_ingress_surface={surface}."
+        )
+    return (
+        "Founder-visible ingress ran through Hermes-local governance and then handed off to the "
+        f"normal external conversation send lane. Recorded governance lane={lane}, "
+        f"operator_ingress_surface={surface}."
+    )
 
 
 def _blocked_result(*, founder_summary: str, reason: str) -> dict[str, Any]:
@@ -896,6 +1061,7 @@ def _persist_whatsapp_outreach_run_record(record: dict[str, Any]) -> Path:
             state["plans"].append({
                 key: value for key, value in plan.items() if key != "approved_targets"
             })
+            _ensure_plan_contract_fields(state["plans"][-1])
             if isinstance(plan_targets, list):
                 target_ids = {
                     target.get("plan_target_id")
@@ -918,6 +1084,7 @@ def _persist_whatsapp_outreach_run_record(record: dict[str, Any]) -> Path:
             state["runs"].append({
                 key: value for key, value in run.items() if key != "target_executions"
             })
+            _ensure_run_contract_fields(state["runs"][-1], plan=plan or {})
             if isinstance(target_executions, list):
                 execution_ids = {
                     execution.get("target_execution_id")
@@ -962,6 +1129,7 @@ def _persist_whatsapp_outreach_run_record(record: dict[str, Any]) -> Path:
                             "destination_target_id",
                             resolved_target.get("destination_target_id"),
                         )
+                    _ensure_execution_contract_fields(execution_row)
                     state["target_executions"].append(execution_row)
         if isinstance(report, dict):
             state["reports"] = [
@@ -969,7 +1137,7 @@ def _persist_whatsapp_outreach_run_record(record: dict[str, Any]) -> Path:
                 for row in state["reports"]
                 if row.get("report_id") != report.get("report_id")
             ]
-            state["reports"].append(dict(report))
+            state["reports"].append(_ensure_report_contract_fields(dict(report)))
         return _write_whatsapp_outreach_state(state)
 
 
@@ -1130,6 +1298,9 @@ async def execute_whatsapp_approved_outreach(
 
     approved_by_principal = "owner_operator"
     run_started_at_utc = utc_isoformat(utc_now())
+    used_legacy_whatsapp_command_ingress = (
+        normalized_request.get("operator_ingress_surface") is None
+    )
 
     with _OUTREACH_STATE_LOCK:
         state = load_whatsapp_outreach_state()
@@ -1147,7 +1318,7 @@ async def execute_whatsapp_approved_outreach(
                     founder_summary=str(founder_summary),
                     reason=str(reason),
                 )
-            plan_row = dict(plan_row)
+            plan_row = _ensure_plan_contract_fields(dict(plan_row))
             plan_targets = [dict(target) for target in active_targets]
         else:
             selected_fields = [
@@ -1219,7 +1390,11 @@ async def execute_whatsapp_approved_outreach(
                     "report_delivery_policy": "initiating_session",
                     "default_report_cadence": "end_of_run",
                     "linked_cron_job_id": None,
+                    "used_legacy_whatsapp_command_ingress": (
+                        used_legacy_whatsapp_command_ingress
+                    ),
                 }
+                _ensure_plan_contract_fields(plan_row)
                 plan_targets = [
                     {
                         "plan_target_id": plan_target_id,
@@ -1236,12 +1411,15 @@ async def execute_whatsapp_approved_outreach(
                     }
                 ]
             else:
-                plan_row = dict(plan_row)
+                plan_row = _ensure_plan_contract_fields(dict(plan_row))
                 plan_row["plan_status"] = "active"
                 if normalized_request.get("operator_ingress_surface"):
                     plan_row["operator_ingress_surface"] = normalized_request.get(
                         "operator_ingress_surface"
                     )
+                    plan_row["used_legacy_whatsapp_command_ingress"] = False
+                elif "used_legacy_whatsapp_command_ingress" not in plan_row:
+                    plan_row["used_legacy_whatsapp_command_ingress"] = True
                 plan_row["communication_skill_name"] = (
                     _normalized_communication_skill_name(
                         plan_row.get("communication_skill_name")
@@ -1279,7 +1457,11 @@ async def execute_whatsapp_approved_outreach(
             "failed_target_count": 0,
             "report_delivery_target": normalized_request.get("report_delivery_target"),
             "report_id": None,
+            "used_legacy_whatsapp_command_ingress": (
+                used_legacy_whatsapp_command_ingress
+            ),
         }
+        _ensure_run_contract_fields(run, plan=plan_row)
         executions: list[dict[str, Any]] = []
         state["plans"] = [
             row for row in state["plans"] if row.get("plan_id") != plan_id
@@ -1323,6 +1505,7 @@ async def execute_whatsapp_approved_outreach(
                 "message_id": None,
                 "last_error": None,
             })
+            _ensure_execution_contract_fields(executions[-1])
         state["runs"] = [row for row in state["runs"] if row.get("run_id") != run_id]
         state["runs"].append(dict(run))
         for execution in executions:
@@ -1399,6 +1582,7 @@ async def execute_whatsapp_approved_outreach(
                     "handoff_reason": None,
                     "uncertainties": [cold_start_error],
                 })
+                _ensure_report_row_contract_fields(target_rows[-1])
                 failed_count += 1
                 completed_count += 1
                 continue
@@ -1450,6 +1634,7 @@ async def execute_whatsapp_approved_outreach(
                     "exact target could not be resolved from preserved history"
                 ],
             })
+            _ensure_report_row_contract_fields(target_rows[-1])
             failed_count += 1
             completed_count += 1
             continue
@@ -1523,6 +1708,7 @@ async def execute_whatsapp_approved_outreach(
             "communication_skill_name": plan_row["communication_skill_name"],
             "last_error": None,
         })
+        _ensure_execution_contract_fields(execution)
 
         outbound_message_text = normalized_request["message_text"]
         execution["communication_stage"] = _select_communication_stage(continuity_rows)
@@ -1695,6 +1881,7 @@ async def execute_whatsapp_approved_outreach(
             "handoff_reason": execution.get("handoff_reason"),
             "uncertainties": row_uncertainties,
         })
+        _ensure_report_row_contract_fields(target_rows[-1])
         if execution["execution_status"] in {"blocked", "send_failed"}:
             failed_count += 1
         completed_count += 1
@@ -1749,6 +1936,11 @@ async def execute_whatsapp_approved_outreach(
         founder_summary = "WhatsApp approved outreach attempted the approved target set but every isolated target execution failed or blocked."
         report_status = "failed"
 
+    founder_summary = (
+        f"{_founder_visible_ingress_summary(operator_ingress_surface=run.get('operator_ingress_surface'), interaction_lane=run.get('interaction_lane'), used_legacy_whatsapp_command_ingress=bool(run.get('used_legacy_whatsapp_command_ingress')))} "
+        f"{founder_summary}"
+    )
+
     if failed_count:
         report_uncertainties.append(
             "one or more targets failed or blocked; review per-target outcome rows"
@@ -1769,6 +1961,7 @@ async def execute_whatsapp_approved_outreach(
         "target_rows": target_rows,
         "uncertainties": report_uncertainties,
     }
+    _ensure_report_contract_fields(report)
     run["report_id"] = report["report_id"]
 
     with _OUTREACH_STATE_LOCK:
@@ -1865,12 +2058,16 @@ def format_whatsapp_approved_outreach_result(result: dict[str, Any]) -> str:
     lines.extend([
         f"plan_id: {plan.get('plan_id')}",
         f"communication_skill_name: {plan.get('communication_skill_name')}",
+        f"conversation_channel_mode: {plan.get('conversation_channel_mode')}",
+        f"operator_governance_policy: {plan.get('operator_governance_policy')}",
         f"run_id: {run.get('run_id')}",
         f"workflow_binding_type: {run.get('workflow_binding_type')}",
         f"workflow_binding_id: {run.get('workflow_binding_id')}",
         f"trigger_source: {run.get('trigger_source')}",
         f"trigger_reference_id: {run.get('trigger_reference_id')}",
         f"operator_ingress_surface: {run.get('operator_ingress_surface')}",
+        f"governance_interaction_lane: {run.get('interaction_lane')}",
+        f"used_legacy_whatsapp_command_ingress: {run.get('used_legacy_whatsapp_command_ingress')}",
         f"operator_objective: {plan.get('operator_objective')}",
         f"run_status: {run.get('run_status')}",
         f"target_count: {run.get('target_count')}",
@@ -1880,6 +2077,7 @@ def format_whatsapp_approved_outreach_result(result: dict[str, Any]) -> str:
         f"communication_stage: {execution.get('communication_stage')}",
         f"draft_outcome: {execution.get('draft_outcome')}",
         f"execution_status: {execution.get('execution_status')}",
+        f"external_interaction_lane: {execution.get('interaction_lane')}",
         f"continuity_mode: {execution.get('continuity_mode')}",
         f"target_resolution_source: {execution.get('target_resolution_source')}",
         f"approved_destination_chat_id_snapshot: {execution.get('approved_destination_chat_id_snapshot')}",
@@ -1905,12 +2103,14 @@ def format_whatsapp_approved_outreach_result(result: dict[str, Any]) -> str:
         lines.extend([
             f"report_id: {report.get('report_id')}",
             f"report_status: {report.get('report_status')}",
+            f"report_interaction_lane: {report.get('interaction_lane')}",
             f"report_target_rows: {len(report.get('target_rows') or [])}",
         ])
         first_report_row = (report.get("target_rows") or [None])[0] or {}
         lines.extend([
             f"report_continuity_mode: {first_report_row.get('continuity_mode')}",
             f"report_had_prior_preserved_thread: {first_report_row.get('had_prior_preserved_thread')}",
+            f"report_row_interaction_lane: {first_report_row.get('interaction_lane')}",
         ])
     if target_executions:
         lines.extend(["", "Target executions:"])
@@ -1921,16 +2121,23 @@ def format_whatsapp_approved_outreach_result(result: dict[str, Any]) -> str:
 
 
 __all__ = [
+    "WHATSAPP_ALLOWED_INTERACTION_LANES",
+    "WHATSAPP_ALLOWED_OPERATOR_INGRESS_SURFACES",
+    "WHATSAPP_CONVERSATION_CHANNEL_MODE",
+    "WHATSAPP_OPERATOR_GOVERNANCE_POLICY",
     "WHATSAPP_APPROVED_OUTREACH_ALLOWED_FIELDS",
     "WHATSAPP_APPROVED_OUTREACH_EXACT_SELECTOR_FIELDS",
     "WHATSAPP_OUTREACH_PLAN_WORKFLOW_BINDING_TYPE",
     "WHATSAPP_OUTREACH_STATE_SCHEMA_VERSION",
     "append_whatsapp_outreach_run_record",
     "build_cli_chat_whatsapp_outreach_requests",
+    "build_local_chat_whatsapp_outreach_requests",
     "bind_whatsapp_outreach_plan_to_cron_job",
     "execute_whatsapp_approved_outreach",
     "format_whatsapp_approved_outreach_result",
     "is_whatsapp_approved_outreach_instruction",
+    "is_whatsapp_legacy_outreach_instruction",
+    "is_whatsapp_local_governance_instruction",
     "load_whatsapp_outreach_state",
     "load_whatsapp_outreach_run_records",
     "normalize_whatsapp_approved_outreach_request",

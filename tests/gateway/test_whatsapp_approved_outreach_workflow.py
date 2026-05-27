@@ -13,6 +13,7 @@ from gateway.whatsapp_message_store import append_whatsapp_record
 from gateway.whatsapp_approved_outreach import (
     WHATSAPP_DEFAULT_COMMUNICATION_SKILL_NAME,
     build_cli_chat_whatsapp_outreach_requests,
+    build_local_chat_whatsapp_outreach_requests,
     bind_whatsapp_outreach_plan_to_cron_job,
     execute_whatsapp_approved_outreach,
     format_whatsapp_approved_outreach_result,
@@ -593,6 +594,76 @@ def test_cli_chat_instruction_normalizes_into_canonical_outreach_request():
     assert operator_instruction["trigger_source"] == "owner_instruction"
     assert operator_instruction["trigger_reference_id"] == "sess-cli-1"
     assert operator_instruction["operator_ingress_surface"] == "cli_chat"
+    assert operator_instruction["interaction_lane"] == "operator_governance"
+    assert operator_instruction["conversation_channel_mode"] == "conversational_primary"
+    assert (
+        operator_instruction["operator_governance_policy"]
+        == "owner_approved_conversation"
+    )
+    assert run_request == operator_instruction
+
+
+def test_local_governance_start_instruction_normalizes_into_same_canonical_request():
+    operator_instruction, run_request = build_cli_chat_whatsapp_outreach_requests(
+        (
+            "whatsapp start approved_destination_chat_id=15551230000@s.whatsapp.net "
+            'operator_objective="Request the first quote" '
+            'message_text="Hello from Hermes."'
+        ),
+        session_id="sess-cli-2",
+    )
+
+    assert operator_instruction["operator_ingress_surface"] == "cli_chat"
+    assert operator_instruction["interaction_lane"] == "operator_governance"
+    assert operator_instruction["conversation_channel_mode"] == "conversational_primary"
+    assert (
+        operator_instruction["operator_governance_policy"]
+        == "owner_approved_conversation"
+    )
+    assert run_request == operator_instruction
+
+
+def test_tui_chat_instruction_normalizes_into_canonical_outreach_request():
+    operator_instruction, run_request = build_local_chat_whatsapp_outreach_requests(
+        (
+            "whatsapp start approved_destination_chat_id=15551230000@s.whatsapp.net "
+            'operator_objective="Request the first quote" '
+            'message_text="Hello from Hermes."'
+        ),
+        session_id="sess-tui-1",
+        operator_ingress_surface="tui_chat",
+    )
+
+    assert operator_instruction["operator_ingress_surface"] == "tui_chat"
+    assert operator_instruction["trigger_reference_id"] == "sess-tui-1"
+    assert operator_instruction["interaction_lane"] == "operator_governance"
+    assert operator_instruction["conversation_channel_mode"] == "conversational_primary"
+    assert (
+        operator_instruction["operator_governance_policy"]
+        == "owner_approved_conversation"
+    )
+    assert run_request == operator_instruction
+
+
+def test_dashboard_chat_instruction_normalizes_into_canonical_outreach_request():
+    operator_instruction, run_request = build_local_chat_whatsapp_outreach_requests(
+        (
+            "whatsapp start approved_destination_chat_id=15551230000@s.whatsapp.net "
+            'operator_objective="Request the first quote" '
+            'message_text="Hello from Hermes."'
+        ),
+        session_id="sess-dashboard-1",
+        operator_ingress_surface="dashboard_chat",
+    )
+
+    assert operator_instruction["operator_ingress_surface"] == "dashboard_chat"
+    assert operator_instruction["trigger_reference_id"] == "sess-dashboard-1"
+    assert operator_instruction["interaction_lane"] == "operator_governance"
+    assert operator_instruction["conversation_channel_mode"] == "conversational_primary"
+    assert (
+        operator_instruction["operator_governance_policy"]
+        == "owner_approved_conversation"
+    )
     assert run_request == operator_instruction
 
 
@@ -640,6 +711,9 @@ async def test_cli_chat_cold_start_instruction_sends_one_first_dm_and_persists_h
     assert result["workflow_status"] == "ready"
     assert result["run"]["trigger_source"] == "owner_instruction"
     assert result["run"]["operator_ingress_surface"] == "cli_chat"
+    assert result["run"]["interaction_lane"] == "operator_governance"
+    assert result["plan"]["conversation_channel_mode"] == "conversational_primary"
+    assert result["plan"]["operator_governance_policy"] == "owner_approved_conversation"
     assert (
         result["execution"]["target_resolution_source"]
         == "approved_destination_chat_id"
@@ -653,6 +727,7 @@ async def test_cli_chat_cold_start_instruction_sends_one_first_dm_and_persists_h
     assert result["execution"]["communication_stage"] == "opening_outreach"
     assert result["execution"]["draft_outcome"] == "send_message"
     assert result["execution"]["execution_status"] == "sent"
+    assert result["execution"]["interaction_lane"] == "external_conversation"
     assert (
         result["execution"]["resolved_target"]["destination_chat_id"]
         == "15551230000@s.whatsapp.net"
@@ -667,6 +742,13 @@ async def test_cli_chat_cold_start_instruction_sends_one_first_dm_and_persists_h
     )
 
     rendered = format_whatsapp_approved_outreach_result(result)
+    assert "conversation_channel_mode: conversational_primary" in rendered
+    assert "operator_governance_policy: owner_approved_conversation" in rendered
+    assert "governance_interaction_lane: operator_governance" in rendered
+    assert "external_interaction_lane: external_conversation" in rendered
+    assert "report_interaction_lane: admin_debug_report" in rendered
+    assert "report_row_interaction_lane: external_conversation" in rendered
+    assert "Founder-visible ingress ran through Hermes-local governance" in rendered
     assert "operator_ingress_surface: cli_chat" in rendered
     assert "target_resolution_source: approved_destination_chat_id" in rendered
     assert (
@@ -685,12 +767,16 @@ async def test_cli_chat_cold_start_instruction_sends_one_first_dm_and_persists_h
     report_row = outreach_state["reports"][0]
 
     assert plan_row["operator_ingress_surface"] == "cli_chat"
+    assert plan_row["interaction_lane"] == "operator_governance"
+    assert plan_row["conversation_channel_mode"] == "conversational_primary"
+    assert plan_row["operator_governance_policy"] == "owner_approved_conversation"
     assert target_row["approved_destination_chat_id"] == "15551230000@s.whatsapp.net"
     assert target_row["target_resolution_source"] == "preserved_history"
     assert target_row["continuity_mode"] == "preserved_thread_follow_up"
     assert target_row["destination_key"] == "whatsapp:dm:15551230000"
     assert target_row["dm_counterparty_id"] == "15551230000"
     assert run_row["operator_ingress_surface"] == "cli_chat"
+    assert run_row["interaction_lane"] == "operator_governance"
     assert execution_row["target_resolution_source"] == "approved_destination_chat_id"
     assert (
         execution_row["approved_destination_chat_id_snapshot"]
@@ -698,16 +784,63 @@ async def test_cli_chat_cold_start_instruction_sends_one_first_dm_and_persists_h
     )
     assert execution_row["had_prior_preserved_thread"] is False
     assert execution_row["continuity_mode"] == "cold_start_first_send_completed"
+    assert execution_row["interaction_lane"] == "external_conversation"
     assert execution_row["history_record_count"] == 0
+    assert report_row["interaction_lane"] == "admin_debug_report"
     assert (
         report_row["target_rows"][0]["continuity_mode"]
         == "cold_start_first_send_completed"
     )
     assert report_row["target_rows"][0]["had_prior_preserved_thread"] is False
+    assert report_row["target_rows"][0]["interaction_lane"] == "external_conversation"
     assert any(
         "without prior preserved thread context" in item
         for item in report_row["target_rows"][0]["uncertainties"]
     )
+
+
+@pytest.mark.asyncio
+async def test_whatsapp_gateway_command_ingress_is_recorded_as_legacy_supporting_path(
+    tmp_path, monkeypatch
+):
+    hermes_home = tmp_path / ".hermes"
+    base_dir = hermes_home / "gateway" / "whatsapp-records"
+    base_dir.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    _append_record(
+        base_dir,
+        record_id="record-1",
+        text="Prior vendor thread context.",
+        participant_role="external_party",
+        message_id="msg-1",
+        effective_event_at="2024-06-02T09:01:00Z",
+    )
+
+    runner = _make_runner(tmp_path)
+    runner.adapters[Platform.WHATSAPP].send = AsyncMock(
+        return_value=SendResult(
+            success=True,
+            message_id="bridge-msg-legacy",
+            raw_response={
+                "dispatch_group_id": "dispatch-legacy",
+                "messageId": "bridge-msg-legacy",
+            },
+        )
+    )
+
+    result = await runner._handle_whatsapp_approved_outreach_instruction(
+        _make_event(
+            "whatsapp outreach destination_key=whatsapp:dm:15551230000 "
+            'operator_objective="request the revised quote" '
+            'message_text="Following up on the revised quote."'
+        )
+    )
+
+    assert "used_legacy_whatsapp_command_ingress: True" in result
+    assert "governance_interaction_lane: operator_governance" in result
+    assert "external_interaction_lane: external_conversation" in result
+    assert "supporting path only" in result
 
 
 @pytest.mark.asyncio
@@ -828,6 +961,8 @@ async def test_cron_triggered_outreach_reuses_bound_plan_and_sets_canonical_trig
     assert result["run"]["workflow_binding_id"] == existing_plan_id
     assert result["run"]["trigger_source"] == "cron_job"
     assert result["run"]["trigger_reference_id"] == "cron-123"
+    assert result["run"]["interaction_lane"] == "operator_governance"
+    assert result["execution"]["interaction_lane"] == "external_conversation"
     assert result["run"]["report_delivery_target"] == "telegram:-100ops"
     assert result["execution"]["resolved_target"]["destination_chat_id"] == (
         "15551230000@s.whatsapp.net"
@@ -1018,6 +1153,7 @@ async def test_bound_plan_batch_run_creates_one_execution_per_active_target_and_
     latest_run = final_state["runs"][-1]
     latest_report = final_state["reports"][-1]
     assert latest_run["run_status"] == "completed_with_failures"
+    assert latest_run["interaction_lane"] == "operator_governance"
     assert latest_run["target_count"] == 2
     assert (
         len([
@@ -1028,4 +1164,8 @@ async def test_bound_plan_batch_run_creates_one_execution_per_active_target_and_
         == 2
     )
     assert latest_report["report_status"] == "partial"
+    assert latest_report["interaction_lane"] == "admin_debug_report"
     assert len(latest_report["target_rows"]) == 2
+    assert {row["interaction_lane"] for row in latest_report["target_rows"]} == {
+        "external_conversation"
+    }
