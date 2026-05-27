@@ -30,6 +30,7 @@ WHATSAPP_APPROVED_OUTREACH_EXACT_SELECTOR_FIELDS = (
 WHATSAPP_APPROVED_OUTREACH_ALLOWED_FIELDS = (
     *WHATSAPP_APPROVED_OUTREACH_EXACT_SELECTOR_FIELDS,
     "approved_destination_chat_id",
+    "continuity_scope_id",
     "operator_objective",
     "message_text",
     "report_delivery_target",
@@ -175,6 +176,9 @@ def normalize_whatsapp_approved_outreach_request(
     return {
         **normalized,
         "approved_destination_chat_id": approved_destination_chat_id,
+        "continuity_scope_id": (
+            str(raw_request.get("continuity_scope_id") or "").strip() or None
+        ),
         "operator_objective": operator_objective or None,
         "message_text": message_text,
         "report_delivery_target": report_delivery_target,
@@ -407,6 +411,115 @@ def _continuity_scope_result(
         "founder_summary": founder_summary,
         "reason": reason,
     }
+
+
+def _derived_direct_message_target_fields(
+    *,
+    selector: dict[str, Any] | None = None,
+    approved_destination_chat_id: str | None = None,
+) -> dict[str, str | None]:
+    if approved_destination_chat_id:
+        destination_fields = build_whatsapp_destination_fields(
+            approved_destination_chat_id
+        )
+        return {
+            "destination_key": _json_safe_string(
+                destination_fields.get("destination_key")
+            ),
+            "dm_counterparty_id": _json_safe_string(
+                destination_fields.get("dm_counterparty_id")
+            ),
+            "approved_destination_chat_id_snapshot": _json_safe_string(
+                destination_fields.get("destination_chat_id")
+            ),
+        }
+
+    normalized_selector = {
+        field: _json_safe_string((selector or {}).get(field))
+        for field in WHATSAPP_APPROVED_OUTREACH_EXACT_SELECTOR_FIELDS
+    }
+    if normalized_selector.get("group_chat_id"):
+        return {
+            "destination_key": None,
+            "dm_counterparty_id": None,
+            "approved_destination_chat_id_snapshot": None,
+        }
+
+    destination_key = normalized_selector.get(
+        "destination_key"
+    ) or normalized_selector.get("conversation_key")
+    dm_counterparty_id = normalized_selector.get("dm_counterparty_id")
+    if (
+        not dm_counterparty_id
+        and destination_key
+        and destination_key.startswith("whatsapp:dm:")
+    ):
+        dm_counterparty_id = destination_key.rsplit(":", 1)[-1]
+    if not destination_key and dm_counterparty_id:
+        destination_key = f"whatsapp:dm:{dm_counterparty_id}"
+
+    return {
+        "destination_key": destination_key,
+        "dm_counterparty_id": dm_counterparty_id,
+        "approved_destination_chat_id_snapshot": None,
+    }
+
+
+def _resolve_requested_validation_scope(
+    state: dict[str, Any],
+    *,
+    continuity_scope_id: str | None,
+    selector: dict[str, Any],
+    approved_destination_chat_id: str | None,
+    plan_targets: list[dict[str, Any]],
+) -> tuple[dict[str, Any] | None, str | None]:
+    if not continuity_scope_id:
+        return None, None
+
+    if len(plan_targets) != 1:
+        return None, "continuity_scope_id requires exactly one approved target"
+
+    scope_row = _find_first(
+        state["continuity_scopes"], "continuity_scope_id", continuity_scope_id
+    )
+    if scope_row is None:
+        return None, "continuity_scope_id not found"
+    if (
+        scope_row.get("continuity_scope_kind")
+        != WHATSAPP_COLD_START_VALIDATION_CONTINUITY_SCOPE_KIND
+    ):
+        return None, "continuity_scope_id must reference a cold_start_validation scope"
+    if scope_row.get("scope_status") != WHATSAPP_CONTINUITY_SCOPE_STATUS_PREPARED:
+        return (
+            None,
+            "continuity_scope_id must reference a prepared cold-start validation scope",
+        )
+    if _json_safe_string(scope_row.get("consumed_by_run_id")):
+        return None, "continuity_scope_id has already been consumed by another run"
+
+    target_fields = _derived_direct_message_target_fields(
+        selector=selector,
+        approved_destination_chat_id=(
+            approved_destination_chat_id
+            or _json_safe_string(scope_row.get("approved_destination_chat_id_snapshot"))
+        ),
+    )
+    if not target_fields.get("destination_key") or not target_fields.get(
+        "dm_counterparty_id"
+    ):
+        return None, "continuity_scope_id must belong to one exact approved DM target"
+
+    if _json_safe_string(scope_row.get("target_destination_key")) != target_fields.get(
+        "destination_key"
+    ) or _json_safe_string(
+        scope_row.get("target_dm_counterparty_id")
+    ) != target_fields.get("dm_counterparty_id"):
+        return (
+            None,
+            "continuity_scope_id must belong to the same exact approved DM target",
+        )
+
+    return scope_row, None
 
 
 def prepare_whatsapp_cold_start_validation(
@@ -679,6 +792,9 @@ def _resolved_target_from_execution(execution: dict[str, Any]) -> dict[str, Any]
 
 def _resolve_target_from_preserved_history(
     selector: dict[str, Any],
+    *,
+    continuity_scope_id: str | None = None,
+    continuity_scope_kind: str | None = None,
 ) -> dict[str, Any]:
     continuity_rows = query_whatsapp_records_any_time(
         conversation_key=selector.get("conversation_key"),
@@ -686,6 +802,8 @@ def _resolve_target_from_preserved_history(
         destination_context_type=selector.get("destination_context_type"),
         group_chat_id=selector.get("group_chat_id"),
         dm_counterparty_id=selector.get("dm_counterparty_id"),
+        continuity_scope_id=continuity_scope_id,
+        continuity_scope_kind=continuity_scope_kind,
     )
     if not continuity_rows:
         return {
@@ -1516,6 +1634,9 @@ async def execute_whatsapp_approved_outreach(
 
     with _OUTREACH_STATE_LOCK:
         state = load_whatsapp_outreach_state()
+        requested_continuity_scope_id = _json_safe_string(
+            normalized_request.get("continuity_scope_id")
+        )
         if (
             normalized_request.get("workflow_binding_type")
             == WHATSAPP_OUTREACH_PLAN_WORKFLOW_BINDING_TYPE
@@ -1635,6 +1756,29 @@ async def execute_whatsapp_approved_outreach(
                 )
                 plan_targets = [dict(existing_target)]
 
+        requested_validation_scope_row, scope_error = (
+            _resolve_requested_validation_scope(
+                state,
+                continuity_scope_id=requested_continuity_scope_id,
+                selector={
+                    field: normalized_request.get(field)
+                    for field in WHATSAPP_APPROVED_OUTREACH_EXACT_SELECTOR_FIELDS
+                },
+                approved_destination_chat_id=_json_safe_string(
+                    normalized_request.get("approved_destination_chat_id")
+                ),
+                plan_targets=plan_targets,
+            )
+        )
+        if scope_error is not None:
+            return _result(
+                workflow_status="blocked",
+                founder_summary=(
+                    "WhatsApp approved outreach stayed blocked because the requested validation scope did not match one exact approved DM target for this run."
+                ),
+                reason=scope_error,
+            )
+
         plan_id = str(plan_row["plan_id"])
         plan_row["communication_skill_name"] = _normalized_communication_skill_name(
             plan_row.get("communication_skill_name")
@@ -1668,10 +1812,17 @@ async def execute_whatsapp_approved_outreach(
             row for row in state["plans"] if row.get("plan_id") != plan_id
         ]
         state["plans"].append(dict(plan_row))
+        continuity_scopes_to_persist: list[dict[str, Any]] = []
         for plan_target_row in plan_targets:
             production_scope_row = _resolved_production_scope_for_target(
                 state, plan_target_row
             )
+            execution_scope_row = production_scope_row
+            if requested_validation_scope_row is not None:
+                execution_scope_row = dict(requested_validation_scope_row)
+                execution_scope_row["scope_status"] = "active"
+                execution_scope_row["consumed_by_run_id"] = run_id
+                continuity_scopes_to_persist.append(dict(execution_scope_row))
             state["plan_targets"] = [
                 row
                 for row in state["plan_targets"]
@@ -1683,12 +1834,12 @@ async def execute_whatsapp_approved_outreach(
                 "run_id": run_id,
                 "plan_target_id": plan_target_row["plan_target_id"],
                 "execution_status": "queued",
-                "continuity_scope_id": production_scope_row.get("continuity_scope_id"),
-                "continuity_scope_kind": production_scope_row.get(
+                "continuity_scope_id": execution_scope_row.get("continuity_scope_id"),
+                "continuity_scope_kind": execution_scope_row.get(
                     "continuity_scope_kind"
                 )
                 or WHATSAPP_PRODUCTION_CONTINUITY_SCOPE_KIND,
-                "cold_start_validation_mode": production_scope_row.get(
+                "cold_start_validation_mode": execution_scope_row.get(
                     "cold_start_validation_mode"
                 )
                 or WHATSAPP_COLD_START_VALIDATION_MODE_NONE,
@@ -1728,6 +1879,18 @@ async def execute_whatsapp_approved_outreach(
                 if row.get("target_execution_id") != execution["target_execution_id"]
             ]
             state["target_executions"].append(dict(execution))
+        if continuity_scopes_to_persist:
+            scope_ids = {
+                scope.get("continuity_scope_id")
+                for scope in continuity_scopes_to_persist
+                if isinstance(scope, dict)
+            }
+            state["continuity_scopes"] = [
+                row
+                for row in state["continuity_scopes"]
+                if row.get("continuity_scope_id") not in scope_ids
+            ]
+            state["continuity_scopes"].extend(continuity_scopes_to_persist)
         _write_whatsapp_outreach_state(state)
 
     send_callable = _resolve_send_callable(adapter)
@@ -1758,6 +1921,10 @@ async def execute_whatsapp_approved_outreach(
             or "preserved_history"
         )
         continuity_mode = _json_safe_string(plan_target_row.get("continuity_mode"))
+        validation_bound_execution = (
+            continuity_scope_kind
+            == WHATSAPP_COLD_START_VALIDATION_CONTINUITY_SCOPE_KIND
+        )
         if target_resolution_source == "approved_destination_chat_id":
             destination_fields = build_whatsapp_destination_fields(
                 str(approved_destination_chat_id or "")
@@ -1840,9 +2007,23 @@ async def execute_whatsapp_approved_outreach(
                 "resolved_target": resolved_target,
             }
         elif len(selected_fields) == 1:
-            resolution = ResolveWhatsAppExactTarget(selector)
+            if (
+                continuity_scope_kind
+                == WHATSAPP_COLD_START_VALIDATION_CONTINUITY_SCOPE_KIND
+            ):
+                resolution = _resolve_target_from_preserved_history(
+                    selector,
+                    continuity_scope_id=continuity_scope_id,
+                    continuity_scope_kind=continuity_scope_kind,
+                )
+            else:
+                resolution = ResolveWhatsAppExactTarget(selector)
         else:
-            resolution = _resolve_target_from_preserved_history(selector)
+            resolution = _resolve_target_from_preserved_history(
+                selector,
+                continuity_scope_id=continuity_scope_id,
+                continuity_scope_kind=continuity_scope_kind,
+            )
         resolved_target = resolution.get("resolved_target")
         if resolution.get("resolution_status") != "resolved" or not isinstance(
             resolved_target, dict
@@ -1912,19 +2093,22 @@ async def execute_whatsapp_approved_outreach(
         if run_window_end_utc is None or history_window_end_utc > run_window_end_utc:
             run_window_end_utc = history_window_end_utc
 
-        plan_target_row.update({
-            **_exact_selector_from_row(resolved_target),
-            "approved_destination_chat_id": approved_destination_chat_id,
-            "target_resolution_source": target_resolution_source,
-            "continuity_mode": continuity_mode
-            or (
-                "cold_start_pending_first_send"
-                if target_resolution_source == "approved_destination_chat_id"
-                else "preserved_thread_follow_up"
-            ),
-            "last_resolved_conversation_key": resolved_target.get("conversation_key"),
-            "last_observed_message_at_utc": history_window_end_utc,
-        })
+        if not validation_bound_execution:
+            plan_target_row.update({
+                **_exact_selector_from_row(resolved_target),
+                "approved_destination_chat_id": approved_destination_chat_id,
+                "target_resolution_source": target_resolution_source,
+                "continuity_mode": continuity_mode
+                or (
+                    "cold_start_pending_first_send"
+                    if target_resolution_source == "approved_destination_chat_id"
+                    else "preserved_thread_follow_up"
+                ),
+                "last_resolved_conversation_key": resolved_target.get(
+                    "conversation_key"
+                ),
+                "last_observed_message_at_utc": history_window_end_utc,
+            })
         execution.update({
             "execution_status": "resolved",
             "continuity_scope_id": continuity_scope_id,
@@ -2053,20 +2237,23 @@ async def execute_whatsapp_approved_outreach(
             persisted_fields = build_whatsapp_destination_fields(
                 str(execution.get("approved_destination_chat_id_snapshot") or "")
             )
-            plan_target_row.update({
-                **_exact_selector_from_row({
-                    "conversation_key": persisted_fields.get("destination_key"),
-                    "destination_key": persisted_fields.get("destination_key"),
-                    "group_chat_id": None,
-                    "dm_counterparty_id": persisted_fields.get("dm_counterparty_id"),
-                }),
-                "target_resolution_source": "preserved_history",
-                "continuity_mode": "preserved_thread_follow_up",
-                "last_resolved_conversation_key": persisted_fields.get(
-                    "destination_key"
-                ),
-                "last_observed_message_at_utc": cold_start_event_at_utc,
-            })
+            if not validation_bound_execution:
+                plan_target_row.update({
+                    **_exact_selector_from_row({
+                        "conversation_key": persisted_fields.get("destination_key"),
+                        "destination_key": persisted_fields.get("destination_key"),
+                        "group_chat_id": None,
+                        "dm_counterparty_id": persisted_fields.get(
+                            "dm_counterparty_id"
+                        ),
+                    }),
+                    "target_resolution_source": "preserved_history",
+                    "continuity_mode": "preserved_thread_follow_up",
+                    "last_resolved_conversation_key": persisted_fields.get(
+                        "destination_key"
+                    ),
+                    "last_observed_message_at_utc": cold_start_event_at_utc,
+                })
             execution.update({
                 "resolved_conversation_key": persisted_fields.get("destination_key"),
                 "resolved_destination_key": persisted_fields.get("destination_key"),
@@ -2253,6 +2440,20 @@ async def execute_whatsapp_approved_outreach(
                 state["target_executions"].append(dict(execution))
             else:
                 persisted_execution.update(dict(execution))
+        if requested_validation_scope_row is not None:
+            persisted_scope = _find_first(
+                state["continuity_scopes"],
+                "continuity_scope_id",
+                requested_validation_scope_row.get("continuity_scope_id"),
+            )
+            if persisted_scope is None:
+                state["continuity_scopes"].append(dict(requested_validation_scope_row))
+            else:
+                persisted_scope.update({
+                    **dict(requested_validation_scope_row),
+                    "scope_status": "active",
+                    "consumed_by_run_id": run_id,
+                })
         state["reports"] = [
             row
             for row in state["reports"]
@@ -2328,7 +2529,11 @@ def format_whatsapp_approved_outreach_result(result: dict[str, Any]) -> str:
         f"communication_stage: {execution.get('communication_stage')}",
         f"draft_outcome: {execution.get('draft_outcome')}",
         f"execution_status: {execution.get('execution_status')}",
+        f"continuity_scope_id: {execution.get('continuity_scope_id')}",
+        f"continuity_scope_kind: {execution.get('continuity_scope_kind')}",
+        f"cold_start_validation_mode: {execution.get('cold_start_validation_mode')}",
         f"continuity_mode: {execution.get('continuity_mode')}",
+        f"freshness_basis: {execution.get('freshness_basis')}",
         f"target_resolution_source: {execution.get('target_resolution_source')}",
         f"approved_destination_chat_id_snapshot: {execution.get('approved_destination_chat_id_snapshot')}",
         f"had_prior_preserved_thread: {execution.get('had_prior_preserved_thread')}",
