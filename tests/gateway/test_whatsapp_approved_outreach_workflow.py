@@ -654,9 +654,10 @@ def test_prepare_cold_start_validation_creates_non_destructive_exact_target_scop
 
     result = prepare_whatsapp_cold_start_validation(
         {
-            "destination_key": "whatsapp:dm:15551230000",
-            "cold_start_validation_mode": WHATSAPP_COLD_START_VALIDATION_MODE_NON_DESTRUCTIVE_ISOLATION,
+            "plan_id": "waplan-1",
+            "dm_counterparty_id": "15551230000",
             "operator_reason": "prepare repeatable strict cold-start validation",
+            "validation_prepare_surface": "cli_command",
         },
         authorized=True,
         created_by_principal="owner_operator",
@@ -675,6 +676,7 @@ def test_prepare_cold_start_validation_creates_non_destructive_exact_target_scop
     assert continuity_scope["approved_destination_chat_id_snapshot"] == (
         "15551230000@s.whatsapp.net"
     )
+    assert continuity_scope["validation_prepare_surface"] == "cli_command"
     assert continuity_scope["created_by_principal"] == "owner_operator"
     assert continuity_scope["operator_reason"] == (
         "prepare repeatable strict cold-start validation"
@@ -692,6 +694,85 @@ def test_prepare_cold_start_validation_creates_non_destructive_exact_target_scop
         == continuity_scope["continuity_scope_id"]
     )
     assert persisted_scope["scope_status"] == "prepared"
+
+
+def test_prepare_cold_start_validation_defaults_to_non_destructive_mode(
+    tmp_path, monkeypatch
+):
+    hermes_home = tmp_path / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    _write_whatsapp_outreach_state({
+        "schema_version": 1,
+        "plans": [
+            {
+                "plan_id": "waplan-1",
+                "plan_status": "active",
+                "trigger_mode": "instruction_only",
+                "communication_skill_name": WHATSAPP_DEFAULT_COMMUNICATION_SKILL_NAME,
+                "operator_objective": "request quote",
+                "approved_by_principal": "owner_operator",
+            }
+        ],
+        "plan_targets": [
+            {
+                "plan_target_id": "watarget-1",
+                "plan_id": "waplan-1",
+                "target_status": "active",
+                "conversation_key": "whatsapp:dm:15551230000",
+                "destination_key": "whatsapp:dm:15551230000",
+                "group_chat_id": None,
+                "dm_counterparty_id": "15551230000",
+                "approved_destination_chat_id": "15551230000@s.whatsapp.net",
+                "target_resolution_source": "preserved_history",
+                "continuity_mode": "preserved_thread_follow_up",
+            }
+        ],
+        "continuity_scopes": [],
+        "runs": [],
+        "target_executions": [],
+        "reports": [],
+    })
+
+    result = prepare_whatsapp_cold_start_validation(
+        {
+            "plan_id": "waplan-1",
+            "dm_counterparty_id": "15551230000",
+            "operator_reason": "default non-destructive prepare",
+            "validation_prepare_surface": "cli_command",
+        },
+        authorized=True,
+        created_by_principal="owner_operator",
+    )
+
+    assert result["workflow_status"] == "prepared"
+    assert result["continuity_scope"]["cold_start_validation_mode"] == (
+        WHATSAPP_COLD_START_VALIDATION_MODE_NON_DESTRUCTIVE_ISOLATION
+    )
+
+
+def test_prepare_cold_start_validation_requires_plan_id_and_dm_counterparty_id():
+    missing_plan = prepare_whatsapp_cold_start_validation(
+        {
+            "dm_counterparty_id": "15551230000",
+            "operator_reason": "missing plan",
+        },
+        authorized=True,
+        created_by_principal="owner_operator",
+    )
+    assert missing_plan["workflow_status"] == "invalid_request"
+    assert missing_plan["reason"] == "plan_id is required"
+
+    missing_dm_counterparty = prepare_whatsapp_cold_start_validation(
+        {
+            "plan_id": "waplan-1",
+            "operator_reason": "missing dm",
+        },
+        authorized=True,
+        created_by_principal="owner_operator",
+    )
+    assert missing_dm_counterparty["workflow_status"] == "invalid_request"
+    assert missing_dm_counterparty["reason"] == "dm_counterparty_id is required"
 
 
 def test_prepare_cold_start_validation_rejects_group_and_ambiguous_targets(
@@ -755,8 +836,9 @@ def test_prepare_cold_start_validation_rejects_group_and_ambiguous_targets(
 
     group_result = prepare_whatsapp_cold_start_validation(
         {
+            "plan_id": "waplan-1",
+            "dm_counterparty_id": "15551230000",
             "group_chat_id": "group-123@g.us",
-            "cold_start_validation_mode": WHATSAPP_COLD_START_VALIDATION_MODE_NON_DESTRUCTIVE_ISOLATION,
             "operator_reason": "prepare validation",
         },
         authorized=True,
@@ -770,8 +852,8 @@ def test_prepare_cold_start_validation_rejects_group_and_ambiguous_targets(
 
     ambiguous_result = prepare_whatsapp_cold_start_validation(
         {
-            "destination_key": "whatsapp:dm:15551230000",
-            "cold_start_validation_mode": WHATSAPP_COLD_START_VALIDATION_MODE_NON_DESTRUCTIVE_ISOLATION,
+            "plan_id": "waplan-1",
+            "dm_counterparty_id": "15551230000",
             "operator_reason": "prepare validation",
         },
         authorized=True,
@@ -837,9 +919,10 @@ async def test_gateway_runner_prepare_surface_returns_validation_scope_details(
     runner = _make_runner(tmp_path)
     rendered = await runner._handle_whatsapp_cold_start_validation_prepare(
         {
-            "destination_key": "whatsapp:dm:15551230000",
-            "cold_start_validation_mode": WHATSAPP_COLD_START_VALIDATION_MODE_NON_DESTRUCTIVE_ISOLATION,
+            "plan_id": "waplan-1",
+            "dm_counterparty_id": "15551230000",
             "operator_reason": "prepare validation from runner seam",
+            "validation_prepare_surface": "cli_command",
         },
         authorized=True,
         created_by_principal="owner_operator",
@@ -855,6 +938,7 @@ async def test_gateway_runner_prepare_surface_returns_validation_scope_details(
         f"cold_start_validation_mode: {WHATSAPP_COLD_START_VALIDATION_MODE_NON_DESTRUCTIVE_ISOLATION}"
         in rendered
     )
+    assert "validation_prepare_surface: cli_command" in rendered
     assert "target_dm_counterparty_id: 15551230000" in rendered
 
 
