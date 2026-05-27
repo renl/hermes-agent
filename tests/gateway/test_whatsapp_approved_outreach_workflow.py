@@ -9,7 +9,10 @@ import pytest
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent, SendResult
 from gateway.session import SessionEntry, SessionSource
-from gateway.whatsapp_message_store import append_whatsapp_record
+from gateway.whatsapp_message_store import (
+    append_whatsapp_record,
+    query_whatsapp_records_any_time,
+)
 from gateway.whatsapp_approved_outreach import (
     WHATSAPP_DEFAULT_COMMUNICATION_SKILL_NAME,
     WHATSAPP_COLD_START_VALIDATION_MODE_NON_DESTRUCTIVE_ISOLATION,
@@ -1053,6 +1056,248 @@ async def test_cli_chat_cold_start_instruction_sends_one_first_dm_and_persists_h
     assert any(
         "without prior preserved thread context" in item
         for item in report_row["target_rows"][0]["uncertainties"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_validation_bound_cold_start_run_uses_only_prepared_scope_and_preserves_production(
+    tmp_path, monkeypatch
+):
+    hermes_home = tmp_path / ".hermes"
+    base_dir = hermes_home / "gateway" / "whatsapp-records"
+    base_dir.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    _append_record(
+        base_dir,
+        record_id="record-1",
+        text="Existing production continuity.",
+        participant_role="external_party",
+        message_id="msg-1",
+        effective_event_at="2024-06-02T09:01:00Z",
+    )
+
+    _write_whatsapp_outreach_state({
+        "schema_version": 1,
+        "plans": [
+            {
+                "plan_id": "waplan-1",
+                "plan_status": "active",
+                "trigger_mode": "instruction_only",
+                "communication_skill_name": WHATSAPP_DEFAULT_COMMUNICATION_SKILL_NAME,
+                "operator_objective": "request quote",
+                "approved_by_principal": "owner_operator",
+            }
+        ],
+        "plan_targets": [
+            {
+                "plan_target_id": "watarget-1",
+                "plan_id": "waplan-1",
+                "target_status": "active",
+                "conversation_key": "whatsapp:dm:15551230000",
+                "destination_key": "whatsapp:dm:15551230000",
+                "group_chat_id": None,
+                "dm_counterparty_id": "15551230000",
+                "approved_destination_chat_id": "15551230000@s.whatsapp.net",
+                "target_resolution_source": "preserved_history",
+                "continuity_mode": "preserved_thread_follow_up",
+                "default_continuity_scope_id": "scope-production-1",
+            }
+        ],
+        "continuity_scopes": [
+            {
+                "continuity_scope_id": "scope-production-1",
+                "plan_target_id": "watarget-1",
+                "continuity_scope_kind": WHATSAPP_PRODUCTION_CONTINUITY_SCOPE_KIND,
+                "cold_start_validation_mode": "none",
+                "scope_status": "active",
+                "target_destination_key": "whatsapp:dm:15551230000",
+                "target_dm_counterparty_id": "15551230000",
+                "approved_destination_chat_id_snapshot": "15551230000@s.whatsapp.net",
+                "created_by_principal": "owner_operator",
+                "created_at_utc": "2024-06-02T09:00:00Z",
+                "operator_reason": "existing production continuity",
+                "consumed_by_run_id": None,
+            },
+            {
+                "continuity_scope_id": "scope-validation-1",
+                "plan_target_id": "watarget-1",
+                "continuity_scope_kind": WHATSAPP_COLD_START_VALIDATION_CONTINUITY_SCOPE_KIND,
+                "cold_start_validation_mode": WHATSAPP_COLD_START_VALIDATION_MODE_NON_DESTRUCTIVE_ISOLATION,
+                "scope_status": "prepared",
+                "target_destination_key": "whatsapp:dm:15551230000",
+                "target_dm_counterparty_id": "15551230000",
+                "approved_destination_chat_id_snapshot": "15551230000@s.whatsapp.net",
+                "created_by_principal": "owner_operator",
+                "created_at_utc": "2024-06-02T10:00:00Z",
+                "operator_reason": "prepare repeatable strict cold-start validation",
+                "consumed_by_run_id": None,
+            },
+        ],
+        "runs": [],
+        "target_executions": [],
+        "reports": [],
+    })
+
+    runner = _make_runner(tmp_path)
+    runner.adapters[Platform.WHATSAPP].send = AsyncMock(
+        return_value=SendResult(
+            success=True,
+            message_id="bridge-validation-1",
+            raw_response={
+                "dispatch_group_id": "dispatch-validation-1",
+                "messageId": "bridge-validation-1",
+            },
+        )
+    )
+
+    _operator_instruction, run_request = build_cli_chat_whatsapp_outreach_requests(
+        (
+            "whatsapp outreach "
+            "approved_destination_chat_id=15551230000@s.whatsapp.net "
+            "continuity_scope_id=scope-validation-1 "
+            'operator_objective="Request the first quote" '
+            'message_text="Hello from Hermes validation."'
+        ),
+        session_id="sess-cli-validation-1",
+    )
+
+    result = await execute_whatsapp_approved_outreach(
+        run_request,
+        authorized=True,
+        adapter=runner.adapters[Platform.WHATSAPP],
+    )
+
+    assert result["workflow_status"] == "ready"
+    assert result["execution"]["continuity_scope_id"] == "scope-validation-1"
+    assert result["execution"]["continuity_scope_kind"] == (
+        WHATSAPP_COLD_START_VALIDATION_CONTINUITY_SCOPE_KIND
+    )
+    assert result["execution"]["cold_start_validation_mode"] == (
+        WHATSAPP_COLD_START_VALIDATION_MODE_NON_DESTRUCTIVE_ISOLATION
+    )
+    assert result["execution"]["freshness_basis"] == "explicit_validation_isolation"
+    assert result["execution"]["continuity_mode"] == "cold_start_first_send_completed"
+    assert result["execution"]["had_prior_preserved_thread"] is False
+    assert result["execution"]["history_record_count"] == 0
+    assert result["run"]["operator_ingress_surface"] == "cli_chat"
+
+    rendered = format_whatsapp_approved_outreach_result(result)
+    assert "continuity_scope_id: scope-validation-1" in rendered
+    assert (
+        f"continuity_scope_kind: {WHATSAPP_COLD_START_VALIDATION_CONTINUITY_SCOPE_KIND}"
+        in rendered
+    )
+    assert "freshness_basis: explicit_validation_isolation" in rendered
+
+    state = load_whatsapp_outreach_state()
+    validation_scope = next(
+        scope
+        for scope in state["continuity_scopes"]
+        if scope["continuity_scope_id"] == "scope-validation-1"
+    )
+    production_scope = next(
+        scope
+        for scope in state["continuity_scopes"]
+        if scope["continuity_scope_id"] == "scope-production-1"
+    )
+    assert validation_scope["scope_status"] == "active"
+    assert validation_scope["consumed_by_run_id"] == result["run"]["run_id"]
+    assert production_scope["scope_status"] == "active"
+    assert production_scope.get("consumed_by_run_id") is None
+
+    validation_rows = query_whatsapp_records_any_time(
+        base_dir=base_dir,
+        destination_key="whatsapp:dm:15551230000",
+        continuity_scope_kind=WHATSAPP_COLD_START_VALIDATION_CONTINUITY_SCOPE_KIND,
+        continuity_scope_id="scope-validation-1",
+    )
+    production_rows = query_whatsapp_records_any_time(
+        base_dir=base_dir,
+        destination_key="whatsapp:dm:15551230000",
+        continuity_scope_kind=WHATSAPP_PRODUCTION_CONTINUITY_SCOPE_KIND,
+    )
+
+    assert [row["text"] for row in validation_rows] == ["Hello from Hermes validation."]
+    assert [row["text"] for row in production_rows] == [
+        "Existing production continuity."
+    ]
+
+
+@pytest.mark.asyncio
+async def test_validation_bound_run_rejects_scope_for_different_exact_target(
+    tmp_path, monkeypatch
+):
+    hermes_home = tmp_path / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    _write_whatsapp_outreach_state({
+        "schema_version": 1,
+        "plans": [
+            {
+                "plan_id": "waplan-1",
+                "plan_status": "active",
+                "trigger_mode": "instruction_only",
+                "communication_skill_name": WHATSAPP_DEFAULT_COMMUNICATION_SKILL_NAME,
+                "operator_objective": "request quote",
+                "approved_by_principal": "owner_operator",
+            }
+        ],
+        "plan_targets": [
+            {
+                "plan_target_id": "watarget-1",
+                "plan_id": "waplan-1",
+                "target_status": "active",
+                "conversation_key": "whatsapp:dm:15551230000",
+                "destination_key": "whatsapp:dm:15551230000",
+                "group_chat_id": None,
+                "dm_counterparty_id": "15551230000",
+                "approved_destination_chat_id": "15551230000@s.whatsapp.net",
+                "target_resolution_source": "preserved_history",
+                "continuity_mode": "preserved_thread_follow_up",
+            }
+        ],
+        "continuity_scopes": [
+            {
+                "continuity_scope_id": "scope-validation-other",
+                "plan_target_id": "watarget-1",
+                "continuity_scope_kind": WHATSAPP_COLD_START_VALIDATION_CONTINUITY_SCOPE_KIND,
+                "cold_start_validation_mode": WHATSAPP_COLD_START_VALIDATION_MODE_NON_DESTRUCTIVE_ISOLATION,
+                "scope_status": "prepared",
+                "target_destination_key": "whatsapp:dm:15559990000",
+                "target_dm_counterparty_id": "15559990000",
+                "approved_destination_chat_id_snapshot": "15559990000@s.whatsapp.net",
+                "created_by_principal": "owner_operator",
+                "created_at_utc": "2024-06-02T10:00:00Z",
+                "operator_reason": "prepare repeatable strict cold-start validation",
+                "consumed_by_run_id": None,
+            }
+        ],
+        "runs": [],
+        "target_executions": [],
+        "reports": [],
+    })
+
+    adapter = MagicMock()
+    adapter.send = AsyncMock()
+
+    result = await execute_whatsapp_approved_outreach(
+        {
+            "approved_destination_chat_id": "15551230000@s.whatsapp.net",
+            "continuity_scope_id": "scope-validation-other",
+            "operator_objective": "Request the first quote",
+            "message_text": "Hello from Hermes validation.",
+            "trigger_source": "owner_instruction",
+            "operator_ingress_surface": "cli_chat",
+        },
+        authorized=True,
+        adapter=adapter,
+    )
+
+    adapter.send.assert_not_awaited()
+    assert result["workflow_status"] == "blocked"
+    assert result["reason"] == (
+        "continuity_scope_id must belong to the same exact approved DM target"
     )
 
 
