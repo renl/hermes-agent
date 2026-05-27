@@ -188,6 +188,7 @@ from gateway.whatsapp_approved_outreach import (
     execute_whatsapp_approved_outreach,
     format_whatsapp_approved_outreach_result,
     is_whatsapp_approved_outreach_instruction,
+    is_whatsapp_local_governance_instruction,
 )
 from hermes_cli.browser_connect import (
     DEFAULT_BROWSER_CDP_URL,
@@ -12264,6 +12265,13 @@ class HermesCLI:
         # register secure secret capture here as well.
         set_secret_capture_callback(self._secret_capture_callback)
 
+        local_governance_response = self._handle_whatsapp_local_operator_turn(
+            message,
+            images=images,
+        )
+        if local_governance_response is not None:
+            return local_governance_response
+
         # Reset the per-turn interrupt flag. Any subsequent path that
         # discovers an interrupt (below, after run_conversation) will flip
         # this to True. Early returns (credential refresh failure, etc.)
@@ -13099,6 +13107,30 @@ class HermesCLI:
             )
         )
         return True
+
+    def _run_whatsapp_local_governance_ingress(self, instruction_text: str) -> bool:
+        return self._run_whatsapp_cli_chat_outreach(instruction_text)
+
+    def _handle_whatsapp_local_operator_turn(
+        self, message: Any, images: list | None = None
+    ) -> Optional[str]:
+        if images or not isinstance(message, str):
+            return None
+
+        history_len_before = len(self.conversation_history)
+        handled = False
+        if is_whatsapp_local_governance_instruction(message):
+            handled = self._run_whatsapp_local_governance_ingress(message)
+        elif is_whatsapp_approved_outreach_instruction(message):
+            handled = self._run_whatsapp_cli_chat_outreach(message)
+
+        if not handled:
+            return None
+
+        for entry in reversed(self.conversation_history[history_len_before:]):
+            if entry.get("role") == "assistant":
+                return str(entry.get("content") or "")
+        return ""
 
     def _audio_level_bar(self) -> str:
         """Return a visual audio level indicator based on current RMS."""
@@ -15561,6 +15593,15 @@ class HermesCLI:
                             user_input = f"[User attached file: {_drop_path}]" + (
                                 f"\n{_remainder}" if _remainder else ""
                             )
+
+                    if (
+                        not _file_drop
+                        and isinstance(user_input, str)
+                        and not submit_images
+                        and is_whatsapp_local_governance_instruction(user_input)
+                    ):
+                        self._run_whatsapp_local_governance_ingress(user_input)
+                        continue
 
                     if (
                         not _file_drop

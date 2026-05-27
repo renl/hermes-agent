@@ -1,4 +1,5 @@
 import atexit
+import asyncio
 import concurrent.futures
 import contextvars
 import copy
@@ -24,6 +25,13 @@ from tui_gateway.transport import (
     bind_transport,
     current_transport,
     reset_transport,
+)
+
+from gateway.whatsapp_approved_outreach import (
+    build_local_chat_whatsapp_outreach_requests,
+    execute_whatsapp_approved_outreach,
+    format_whatsapp_approved_outreach_result,
+    is_whatsapp_local_governance_instruction,
 )
 
 logger = logging.getLogger(__name__)
@@ -143,18 +151,16 @@ _DETAIL_MODES = frozenset({"hidden", "collapsed", "expanded"})
 # everything else stays on the main thread so ordering stays sane for the
 # fast path.  write_json is already _stdout_lock-guarded, so concurrent
 # response writes are safe.
-_LONG_HANDLERS = frozenset(
-    {
-        "browser.manage",
-        "cli.exec",
-        "session.branch",
-        "session.compress",
-        "session.resume",
-        "shell.exec",
-        "skills.manage",
-        "slash.exec",
-    }
-)
+_LONG_HANDLERS = frozenset({
+    "browser.manage",
+    "cli.exec",
+    "session.branch",
+    "session.compress",
+    "session.resume",
+    "shell.exec",
+    "skills.manage",
+    "slash.exec",
+})
 
 try:
     _rpc_pool_workers = max(
@@ -389,6 +395,123 @@ def _emit(event: str, sid: str, payload: dict | None = None):
     write_json({"jsonrpc": "2.0", "method": "event", "params": params})
 
 
+def _is_dashboard_transport(session: dict) -> bool:
+    if os.environ.get("HERMES_TUI_SIDECAR_URL"):
+        return True
+    transport = session.get("transport")
+    return type(transport).__name__ == "WSTransport"
+
+
+def _whatsapp_operator_ingress_surface_for_session(session: dict) -> str:
+    return "dashboard_chat" if _is_dashboard_transport(session) else "tui_chat"
+
+
+def _execute_async(coro):
+    return asyncio.run(coro)
+
+
+def _run_whatsapp_local_governance_ingress(
+    *, sid: str, session: dict, text: str
+) -> dict[str, Any]:
+    from gateway.config import Platform, load_gateway_config
+    from gateway.platforms.whatsapp import WhatsAppAdapter
+
+    def _result_messages(
+        rendered_text: str, operator_instruction: dict[str, Any] | None
+    ) -> dict[str, Any]:
+        history = list(session.get("history", []))
+        if operator_instruction is not None:
+            history.append({
+                "role": "user",
+                "content": json.dumps(operator_instruction, ensure_ascii=False),
+            })
+        history.append({"role": "assistant", "content": rendered_text})
+        return {"final_response": rendered_text, "messages": history}
+
+    operator_ingress_surface = _whatsapp_operator_ingress_surface_for_session(session)
+    try:
+        operator_instruction, run_request = build_local_chat_whatsapp_outreach_requests(
+            text,
+            session_id=sid,
+            operator_ingress_surface=operator_ingress_surface,
+        )
+    except ValueError as exc:
+        rendered = format_whatsapp_approved_outreach_result({
+            "workflow_status": "invalid_request",
+            "reason": str(exc),
+            "founder_summary": (
+                "WhatsApp approved outreach could not start because the local governance "
+                "instruction was invalid."
+            ),
+        })
+        return _result_messages(rendered, None)
+
+    try:
+        gateway_config = load_gateway_config()
+        platform_config = gateway_config.platforms.get(Platform.WHATSAPP)
+    except Exception as exc:
+        rendered = format_whatsapp_approved_outreach_result({
+            "workflow_status": "invalid_request",
+            "reason": str(exc),
+            "founder_summary": "WhatsApp approved outreach stayed blocked because gateway config could not be loaded.",
+        })
+        return _result_messages(rendered, operator_instruction)
+
+    if not platform_config or not platform_config.enabled:
+        rendered = format_whatsapp_approved_outreach_result({
+            "workflow_status": "invalid_request",
+            "reason": "WhatsApp is not configured or enabled in gateway config.",
+            "founder_summary": "WhatsApp approved outreach stayed blocked because WhatsApp is not configured.",
+        })
+        return _result_messages(rendered, operator_instruction)
+
+    try:
+        adapter = WhatsAppAdapter(platform_config)
+    except Exception as exc:
+        rendered = format_whatsapp_approved_outreach_result({
+            "workflow_status": "invalid_request",
+            "reason": str(exc),
+            "founder_summary": "WhatsApp approved outreach stayed blocked because the WhatsApp adapter could not start.",
+        })
+        return _result_messages(rendered, operator_instruction)
+
+    async def _run_outreach_flow() -> dict[str, Any] | None:
+        connected = await adapter.connect()
+        if not connected:
+            return None
+        try:
+            return await execute_whatsapp_approved_outreach(
+                run_request,
+                authorized=True,
+                adapter=adapter,
+            )
+        finally:
+            try:
+                await adapter.disconnect()
+            except Exception:
+                pass
+
+    try:
+        result = _execute_async(_run_outreach_flow())
+    except Exception as exc:
+        rendered = format_whatsapp_approved_outreach_result({
+            "workflow_status": "invalid_request",
+            "reason": str(exc),
+            "founder_summary": "WhatsApp approved outreach failed during local governance execution.",
+        })
+        return _result_messages(rendered, operator_instruction)
+    if result is None:
+        rendered = format_whatsapp_approved_outreach_result({
+            "workflow_status": "invalid_request",
+            "reason": "WhatsApp bridge is unavailable; cold-start send stayed blocked.",
+            "founder_summary": "WhatsApp approved outreach stayed blocked because the WhatsApp bridge is unavailable.",
+        })
+        return _result_messages(rendered, operator_instruction)
+
+    rendered = format_whatsapp_approved_outreach_result(result)
+    return _result_messages(rendered, operator_instruction)
+
+
 def _status_update(sid: str, kind: str, text: str | None = None):
     body = (text if text is not None else kind).strip()
     if not body:
@@ -582,7 +705,9 @@ def _start_agent_build(sid: str, session: dict) -> None:
                 pass
 
             _wire_callbacks(sid)
-            _sessions[sid]["_notif_stop"] = _start_notification_poller(sid, _sessions[sid])
+            _sessions[sid]["_notif_stop"] = _start_notification_poller(
+                sid, _sessions[sid]
+            )
             _notify_session_boundary("on_session_reset", key)
 
             info = _session_info(agent)
@@ -1769,11 +1894,13 @@ def _agent_cbs(sid: str) -> dict:
         "tool_complete_callback": lambda tc_id, name, args, result: _on_tool_complete(
             sid, tc_id, name, args, result
         ),
-        "tool_progress_callback": lambda event_type, name=None, preview=None, args=None, **kwargs: _on_tool_progress(
-            sid, event_type, name, preview, args, **kwargs
+        "tool_progress_callback": lambda event_type, name=None, preview=None, args=None, **kwargs: (
+            _on_tool_progress(sid, event_type, name, preview, args, **kwargs)
         ),
-        "tool_gen_callback": lambda name: _tool_progress_enabled(sid)
-        and _emit("tool.generating", sid, {"name": name}),
+        "tool_gen_callback": lambda name: (
+            _tool_progress_enabled(sid)
+            and _emit("tool.generating", sid, {"name": name})
+        ),
         "thinking_callback": lambda text: _emit("thinking.delta", sid, {"text": text}),
         "reasoning_callback": lambda text: _emit(
             "reasoning.delta",
@@ -1823,9 +1950,9 @@ def _render_personality_prompt(value) -> str:
     if isinstance(value, dict):
         parts = [value.get("system_prompt", "")]
         if value.get("tone"):
-            parts.append(f'Tone: {value["tone"]}')
+            parts.append(f"Tone: {value['tone']}")
         if value.get("style"):
-            parts.append(f'Style: {value["style"]}')
+            parts.append(f"Style: {value['style']}")
         return "\n".join(p for p in parts if p)
     return str(value)
 
@@ -1959,7 +2086,9 @@ def _background_agent_kwargs(agent, task_id: str) -> dict:
             agent, "provider_require_parameters", False
         ),
         "provider_data_collection": getattr(agent, "provider_data_collection", None),
-        "openrouter_min_coding_score": getattr(agent, "openrouter_min_coding_score", None),
+        "openrouter_min_coding_score": getattr(
+            agent, "openrouter_min_coding_score", None
+        ),
         "session_id": task_id,
         "reasoning_config": getattr(agent, "reasoning_config", None)
         or _load_reasoning_config(),
@@ -2220,9 +2349,11 @@ def _history_to_messages(history: list[dict]) -> list[dict]:
             tc_info = tool_call_args.get(tc_id) if tc_id else None
             name = (tc_info[0] if tc_info else None) or m.get("tool_name") or "tool"
             args = (tc_info[1] if tc_info else None) or {}
-            messages.append(
-                {"role": "tool", "name": name, "context": _tool_ctx(name, args)}
-            )
+            messages.append({
+                "role": "tool",
+                "name": name,
+                "context": _tool_ctx(name, args),
+            })
             continue
         if not content_text.strip():
             continue
@@ -2592,15 +2723,13 @@ def _(rid, params: dict) -> dict:
     title = (meta.get("title") or "").strip()
     if title:
         lines.append(f"Title: {title}")
-    lines.extend(
-        [
-            f"Model: {model} ({provider})",
-            f"Created: {created.strftime('%Y-%m-%d %H:%M')}",
-            f"Last Activity: {updated.strftime('%Y-%m-%d %H:%M')}",
-            f"Tokens: {int(usage.get('total') or 0):,}",
-            f"Agent Running: {'Yes' if session.get('running') else 'No'}",
-        ]
-    )
+    lines.extend([
+        f"Model: {model} ({provider})",
+        f"Created: {created.strftime('%Y-%m-%d %H:%M')}",
+        f"Last Activity: {updated.strftime('%Y-%m-%d %H:%M')}",
+        f"Tokens: {int(usage.get('total') or 0):,}",
+        f"Agent Running: {'Yes' if session.get('running') else 'No'}",
+    ])
     return _ok(rid, {"output": "\n".join(lines)})
 
 
@@ -3063,16 +3192,14 @@ def _(rid, params: dict) -> dict:
                 except Exception:
                     raw = {}
                 subagents = raw.get("subagents") or []
-                entries.append(
-                    {
-                        "path": str(p),
-                        "session_id": raw.get("session_id") or d.name,
-                        "finished_at": raw.get("finished_at") or stat.st_mtime,
-                        "started_at": raw.get("started_at"),
-                        "label": raw.get("label") or "",
-                        "count": len(subagents) if isinstance(subagents, list) else 0,
-                    }
-                )
+                entries.append({
+                    "path": str(p),
+                    "session_id": raw.get("session_id") or d.name,
+                    "finished_at": raw.get("finished_at") or stat.st_mtime,
+                    "started_at": raw.get("started_at"),
+                    "label": raw.get("label") or "",
+                    "count": len(subagents) if isinstance(subagents, list) else 0,
+                })
             except OSError:
                 continue
 
@@ -3198,7 +3325,9 @@ def _notification_poller_loop(
             continue
 
         _evt_sid = evt.get("session_id", "")
-        if evt.get("type") == "completion" and process_registry.is_completion_consumed(_evt_sid):
+        if evt.get("type") == "completion" and process_registry.is_completion_consumed(
+            _evt_sid
+        ):
             continue
 
         text = format_process_notification(evt)
@@ -3234,7 +3363,9 @@ def _notification_poller_loop(
         except Exception:
             break
         _evt_sid = evt.get("session_id", "")
-        if evt.get("type") == "completion" and process_registry.is_completion_consumed(_evt_sid):
+        if evt.get("type") == "completion" and process_registry.is_completion_consumed(
+            _evt_sid
+        ):
             continue
         text = format_process_notification(evt)
         if not text:
@@ -3330,74 +3461,85 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                     return
                 prompt = ctx.message
 
-            # Decide image routing per-turn based on active provider/model.
-            # "native" → pass pixels to the main model as OpenAI-style content
-            # parts (adapters translate for Anthropic/Gemini/Bedrock/etc.).
-            # "text"   → pre-analyze with vision_analyze and prepend the text.
-            # See agent/image_routing.py for the full decision table.
-            run_message: Any = prompt
-            if images:
-                try:
-                    from agent.image_routing import (
-                        decide_image_input_mode,
-                        build_native_content_parts,
-                    )
-                    from agent.auxiliary_client import (
-                        _read_main_model,
-                        _read_main_provider,
-                    )
-                    from hermes_cli.config import load_config as _tui_load_config
-
-                    _cfg = _tui_load_config()
-                    _mode = decide_image_input_mode(
-                        _read_main_provider(),
-                        _read_main_model(),
-                        _cfg,
-                    )
-                    if getattr(agent, "api_mode", "") == "codex_app_server":
-                        _mode = "text"
-                except Exception as _img_exc:
-                    print(
-                        f"[tui_gateway] image_routing decision failed, defaulting to text: {_img_exc}",
-                        file=sys.stderr,
-                    )
-                    _mode = "text"
-
-                if _mode == "native":
+            if isinstance(prompt, str) and is_whatsapp_local_governance_instruction(
+                prompt
+            ):
+                result = _run_whatsapp_local_governance_ingress(
+                    sid=sid,
+                    session=session,
+                    text=prompt,
+                )
+            else:
+                # Decide image routing per-turn based on active provider/model.
+                # "native" → pass pixels to the main model as OpenAI-style content
+                # parts (adapters translate for Anthropic/Gemini/Bedrock/etc.).
+                # "text"   → pre-analyze with vision_analyze and prepend the text.
+                # See agent/image_routing.py for the full decision table.
+                run_message: Any = prompt
+                if images:
                     try:
-                        _parts, _skipped = build_native_content_parts(
-                            prompt,
-                            images,
+                        from agent.image_routing import (
+                            decide_image_input_mode,
+                            build_native_content_parts,
                         )
-                        if _skipped:
-                            print(
-                                f"[tui_gateway] native image attachment skipped {len(_skipped)} unreadable path(s)",
-                                file=sys.stderr,
-                            )
-                        if any(p.get("type") == "image_url" for p in _parts):
-                            run_message = _parts
-                        else:
-                            run_message = _enrich_with_attached_images(prompt, images)
+                        from agent.auxiliary_client import (
+                            _read_main_model,
+                            _read_main_provider,
+                        )
+                        from hermes_cli.config import load_config as _tui_load_config
+
+                        _cfg = _tui_load_config()
+                        _mode = decide_image_input_mode(
+                            _read_main_provider(),
+                            _read_main_model(),
+                            _cfg,
+                        )
+                        if getattr(agent, "api_mode", "") == "codex_app_server":
+                            _mode = "text"
                     except Exception as _img_exc:
                         print(
-                            f"[tui_gateway] native attach failed, falling back to text: {_img_exc}",
+                            f"[tui_gateway] image_routing decision failed, defaulting to text: {_img_exc}",
                             file=sys.stderr,
                         )
+                        _mode = "text"
+
+                    if _mode == "native":
+                        try:
+                            _parts, _skipped = build_native_content_parts(
+                                prompt,
+                                images,
+                            )
+                            if _skipped:
+                                print(
+                                    f"[tui_gateway] native image attachment skipped {len(_skipped)} unreadable path(s)",
+                                    file=sys.stderr,
+                                )
+                            if any(p.get("type") == "image_url" for p in _parts):
+                                run_message = _parts
+                            else:
+                                run_message = _enrich_with_attached_images(
+                                    prompt, images
+                                )
+                        except Exception as _img_exc:
+                            print(
+                                f"[tui_gateway] native attach failed, falling back to text: {_img_exc}",
+                                file=sys.stderr,
+                            )
+                            run_message = _enrich_with_attached_images(prompt, images)
+                    else:
                         run_message = _enrich_with_attached_images(prompt, images)
-                else:
-                    run_message = _enrich_with_attached_images(prompt, images)
 
-            def _stream(delta):
-                payload = {"text": delta}
-                if streamer and (r := streamer.feed(delta)) is not None:
-                    payload["rendered"] = r
-                _emit("message.delta", sid, payload)
+                def _stream(delta):
+                    payload = {"text": delta}
+                    if streamer and (r := streamer.feed(delta)) is not None:
+                        payload["rendered"] = r
+                    _emit("message.delta", sid, payload)
 
-            result = agent.run_conversation(
-                run_message,
-                conversation_history=list(history),
-                stream_callback=_stream,
-            )
+                result = agent.run_conversation(
+                    run_message,
+                    conversation_history=list(history),
+                    stream_callback=_stream,
+                )
 
             last_reasoning = None
             status_note = None
@@ -3435,14 +3577,19 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 # worker-backed commands (/title etc.) target the live session.
                 # Fix for #20001.
                 _sync_session_key_after_compress(
-                    sid, session, clear_pending_title=False, restart_slash_worker=True,
+                    sid,
+                    session,
+                    clear_pending_title=False,
+                    restart_slash_worker=True,
                 )
 
                 raw = result.get("final_response", "")
                 status = (
                     "interrupted"
                     if result.get("interrupted")
-                    else "error" if result.get("error") else "complete"
+                    else "error"
+                    if result.get("error")
+                    else "complete"
                 )
                 # When the backend produced no visible response AND reported a
                 # real error (e.g. invalid model slug → provider 4xx), surface
@@ -3452,8 +3599,10 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 # Leaves the None-with-no-error path untouched: an empty
                 # successful turn still renders as empty, and the existing
                 # "(empty)" sentinel handling stays in its own lane.
-                if (not raw) and result.get("error") and (
-                    result.get("failed") or result.get("partial")
+                if (
+                    (not raw)
+                    and result.get("error")
+                    and (result.get("failed") or result.get("partial"))
                 ):
                     raw = f"Error: {result.get('error')}"
                 lr = result.get("last_reasoning")
@@ -3534,7 +3683,8 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                         session["pending_title"] = None
                         logger.info(
                             "Dropping pending title for session %s: %s",
-                            _session_key, exc,
+                            _session_key,
+                            exc,
                         )
                     except Exception:
                         # Transient DB failure — keep pending_title for retry.
@@ -4516,15 +4666,13 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 5015, str(e))
 
 
-_TUI_HIDDEN: frozenset[str] = frozenset(
-    {
-        "sethome",
-        "set-home",
-        "commands",
-        "approve",
-        "deny",
-    }
-)
+_TUI_HIDDEN: frozenset[str] = frozenset({
+    "sethome",
+    "set-home",
+    "commands",
+    "approve",
+    "deny",
+})
 
 _TUI_EXTRA: list[tuple[str, str, str]] = [
     ("/compact", "Toggle compact display mode", "TUI"),
@@ -4539,16 +4687,14 @@ _TUI_EXTRA: list[tuple[str, str, str]] = [
 # Commands that queue messages onto _pending_input in the CLI.
 # In the TUI the slash worker subprocess has no reader for that queue,
 # so slash.exec rejects them → TUI falls through to command.dispatch.
-_PENDING_INPUT_COMMANDS: frozenset[str] = frozenset(
-    {
-        "retry",
-        "queue",
-        "q",
-        "steer",
-        "plan",
-        "goal",
-    }
-)
+_PENDING_INPUT_COMMANDS: frozenset[str] = frozenset({
+    "retry",
+    "queue",
+    "q",
+    "steer",
+    "plan",
+    "goal",
+})
 
 _WORKER_BLOCKED_COMMANDS: frozenset[str] = frozenset({"snapshot", "snap"})
 
@@ -4986,25 +5132,23 @@ def _(rid, params: dict) -> dict:
 
 _FUZZY_CACHE_TTL_S = 5.0
 _FUZZY_CACHE_MAX_FILES = 20000
-_FUZZY_FALLBACK_EXCLUDES = frozenset(
-    {
-        ".git",
-        ".hg",
-        ".svn",
-        ".next",
-        ".cache",
-        ".venv",
-        "venv",
-        "node_modules",
-        "__pycache__",
-        "dist",
-        "build",
-        "target",
-        ".mypy_cache",
-        ".pytest_cache",
-        ".ruff_cache",
-    }
-)
+_FUZZY_FALLBACK_EXCLUDES = frozenset({
+    ".git",
+    ".hg",
+    ".svn",
+    ".next",
+    ".cache",
+    ".venv",
+    "venv",
+    "node_modules",
+    "__pycache__",
+    "dist",
+    "build",
+    "target",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+})
 _fuzzy_cache_lock = threading.Lock()
 _fuzzy_cache: dict[str, tuple[float, list[str]]] = {}
 
@@ -5207,13 +5351,11 @@ def _(rid, params: dict) -> dict:
             ranked.sort(key=lambda r: (r[0], len(r[1]), r[1]))
             tag = prefix_tag or "file"
             for _, rel, basename in ranked[:30]:
-                items.append(
-                    {
-                        "text": f"@{tag}:{rel}",
-                        "display": basename,
-                        "meta": os.path.dirname(rel),
-                    }
-                )
+                items.append({
+                    "text": f"@{tag}:{rel}",
+                    "display": basename,
+                    "meta": os.path.dirname(rel),
+                })
 
             return _ok(rid, {"items": items})
 
@@ -5258,13 +5400,11 @@ def _(rid, params: dict) -> dict:
             else:
                 text = rel + suffix
 
-            items.append(
-                {
-                    "text": text,
-                    "display": entry + suffix,
-                    "meta": "dir" if is_dir else "",
-                }
-            )
+            items.append({
+                "text": text,
+                "display": entry + suffix,
+                "meta": "dir" if is_dir else "",
+            })
             if len(items) >= 30:
                 break
     except Exception as e:
@@ -5330,7 +5470,9 @@ def _details_completions(text: str) -> list[dict] | None:
                 (
                     "section override"
                     if candidate in sections
-                    else "cycle global mode" if candidate == "cycle" else "global mode"
+                    else "cycle global mode"
+                    if candidate == "cycle"
+                    else "global mode"
                 ),
             )
             for candidate in candidates
@@ -5540,7 +5682,9 @@ def _(rid, params: dict) -> dict:
             current_base_url=getattr(agent, "base_url", "") if agent else "",
         )
         payload = build_models_payload(
-            ctx, picker_hints=True, max_models=50,
+            ctx,
+            picker_hints=True,
+            max_models=50,
         )
         provider_data = next(
             (p for p in payload["providers"] if p["slug"] == slug), None
@@ -6226,7 +6370,10 @@ def _failure_messages(url: str, port: int, system: str) -> list[str]:
 
     command = manual_chrome_debug_command(port, system)
     hint = (
-        ["Start a Chromium-family browser with remote debugging, then retry /browser connect:", command]
+        [
+            "Start a Chromium-family browser with remote debugging, then retry /browser connect:",
+            command,
+        ]
         if command
         else [
             "No supported Chromium-family browser executable was found in this environment.",
@@ -6333,7 +6480,9 @@ def _browser_connect(rid, params: dict) -> dict:
                             break
 
                 if ok:
-                    announce(f"Chromium-family browser launched and listening on port {port}")
+                    announce(
+                        f"Chromium-family browser launched and listening on port {port}"
+                    )
                 else:
                     for line in _failure_messages(url, port, system)[1:]:
                         announce(line, level="error")
@@ -6458,15 +6607,13 @@ def _(rid, params: dict) -> dict:
             info = get_toolset_info(name)
             if not info:
                 continue
-            items.append(
-                {
-                    "name": name,
-                    "description": info["description"],
-                    "tool_count": info["tool_count"],
-                    "enabled": name in enabled if enabled else True,
-                    "tools": info["resolved_tools"],
-                }
-            )
+            items.append({
+                "name": name,
+                "description": info["description"],
+                "tool_count": info["tool_count"],
+                "enabled": name in enabled if enabled else True,
+                "tools": info["resolved_tools"],
+            })
         return _ok(rid, {"toolsets": items})
     except Exception as e:
         return _err(rid, 5031, str(e))
@@ -6491,12 +6638,10 @@ def _(rid, params: dict) -> dict:
             desc = str(tool["function"].get("description", "") or "").split("\n")[0]
             if ". " in desc:
                 desc = desc[: desc.index(". ") + 1]
-            sections.setdefault(get_toolset_for_tool(name) or "unknown", []).append(
-                {
-                    "name": name,
-                    "description": desc,
-                }
-            )
+            sections.setdefault(get_toolset_for_tool(name) or "unknown", []).append({
+                "name": name,
+                "description": desc,
+            })
 
         return _ok(
             rid,
@@ -6598,14 +6743,12 @@ def _(rid, params: dict) -> dict:
             info = get_toolset_info(name)
             if not info:
                 continue
-            items.append(
-                {
-                    "name": name,
-                    "description": info["description"],
-                    "tool_count": info["tool_count"],
-                    "enabled": name in enabled if enabled else True,
-                }
-            )
+            items.append({
+                "name": name,
+                "description": info["description"],
+                "tool_count": info["tool_count"],
+                "enabled": name in enabled if enabled else True,
+            })
         return _ok(rid, {"toolsets": items})
     except Exception as e:
         return _err(rid, 5032, str(e))

@@ -9,6 +9,10 @@ import pytest
 from gateway.config import Platform
 from gateway.platforms.base import MessageEvent, SendResult
 from gateway.session import SessionSource
+from gateway.whatsapp_approved_outreach import (
+    is_whatsapp_legacy_outreach_instruction,
+    is_whatsapp_local_governance_instruction,
+)
 from gateway.whatsapp_message_store import (
     query_latest_whatsapp_record,
     query_whatsapp_records,
@@ -306,3 +310,15 @@ async def test_query_latest_whatsapp_record_sees_latest_logged_outbound_chunk(
     assert latest is not None
     assert latest["message_id"] == "msg-2"
     assert latest["dispatch_group_sequence"] == 2
+
+
+def test_local_governance_prefix_is_primary_and_legacy_prefix_remains_supporting():
+    assert is_whatsapp_local_governance_instruction(
+        "whatsapp start approved_destination_chat_id=15551230000@s.whatsapp.net operator_objective=test"
+    )
+    assert is_whatsapp_local_governance_instruction(
+        "whatsapp revise destination_key=whatsapp:dm:15551230000 operator_objective=test"
+    )
+    assert is_whatsapp_legacy_outreach_instruction(
+        "whatsapp outreach destination_key=whatsapp:dm:15551230000 operator_objective=test"
+    )
