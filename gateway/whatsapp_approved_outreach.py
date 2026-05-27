@@ -49,6 +49,7 @@ WHATSAPP_COLD_START_VALIDATION_MODE_NONE = "none"
 WHATSAPP_COLD_START_VALIDATION_MODE_NON_DESTRUCTIVE_ISOLATION = (
     "non_destructive_isolation"
 )
+WHATSAPP_COLD_START_VALIDATION_PREPARE_SURFACE_CLI_COMMAND = "cli_command"
 WHATSAPP_CONTINUITY_SCOPE_STATUS_PREPARED = "prepared"
 WHATSAPP_FRESHNESS_BASIS_PRESERVED_HISTORY_AVAILABLE = "preserved_history_available"
 WHATSAPP_FRESHNESS_BASIS_NATURAL_NO_PRIOR_HISTORY = "natural_no_prior_history"
@@ -424,9 +425,33 @@ def prepare_whatsapp_cold_start_validation(
         )
 
     raw_request = request or {}
+    plan_id = _json_safe_string(raw_request.get("plan_id"))
+    if not plan_id:
+        return _continuity_scope_result(
+            workflow_status="invalid_request",
+            founder_summary=(
+                "WhatsApp cold-start validation could not prepare because the exact approved plan was missing."
+            ),
+            reason="plan_id is required",
+        )
+
+    dm_counterparty_id = _json_safe_string(raw_request.get("dm_counterparty_id"))
+    if not dm_counterparty_id:
+        return _continuity_scope_result(
+            workflow_status="invalid_request",
+            founder_summary=(
+                "WhatsApp cold-start validation could not prepare because the exact approved DM target was missing."
+            ),
+            reason="dm_counterparty_id is required",
+        )
+
     cold_start_validation_mode = _json_safe_string(
         raw_request.get("cold_start_validation_mode")
     )
+    if not cold_start_validation_mode:
+        cold_start_validation_mode = (
+            WHATSAPP_COLD_START_VALIDATION_MODE_NON_DESTRUCTIVE_ISOLATION
+        )
     if (
         cold_start_validation_mode
         != WHATSAPP_COLD_START_VALIDATION_MODE_NON_DESTRUCTIVE_ISOLATION
@@ -457,26 +482,38 @@ def prepare_whatsapp_cold_start_validation(
     approved_destination_chat_id = _json_safe_string(
         raw_request.get("approved_destination_chat_id")
     )
-    selector = {
-        field: _json_safe_string(raw_request.get(field))
-        for field in WHATSAPP_APPROVED_OUTREACH_EXACT_SELECTOR_FIELDS
-    }
-    selected_fields = [field for field, value in selector.items() if value]
-    if approved_destination_chat_id and selected_fields:
-        return _continuity_scope_result(
-            workflow_status="invalid_request",
-            founder_summary=(
-                "WhatsApp cold-start validation could not prepare because the request mixed preserved-thread selectors with a cold-start DM target."
-            ),
-            reason="prepare requires exactly one target basis",
+    validation_prepare_surface = _json_safe_string(
+        raw_request.get("validation_prepare_surface")
+    )
+    if not validation_prepare_surface:
+        validation_prepare_surface = (
+            WHATSAPP_COLD_START_VALIDATION_PREPARE_SURFACE_CLI_COMMAND
         )
-    if not approved_destination_chat_id and len(selected_fields) != 1:
+
+    if _json_safe_string(raw_request.get("group_chat_id")):
         return _continuity_scope_result(
             workflow_status="invalid_request",
             founder_summary=(
-                "WhatsApp cold-start validation could not prepare because the request did not provide one exact approved DM target."
+                "WhatsApp cold-start validation could not prepare because v1 validation is direct-message only."
             ),
-            reason="prepare requires exactly one exact target",
+            reason="group targets are unsupported for cold-start validation",
+        )
+
+    unsupported_selector_fields = [
+        field
+        for field in (
+            "conversation_key",
+            "destination_key",
+        )
+        if _json_safe_string(raw_request.get(field))
+    ]
+    if unsupported_selector_fields:
+        return _continuity_scope_result(
+            workflow_status="invalid_request",
+            founder_summary=(
+                "WhatsApp cold-start validation could not prepare because the request widened beyond one exact plan-scoped DM target."
+            ),
+            reason="prepare requires exact plan_id and dm_counterparty_id only",
         )
 
     with _OUTREACH_STATE_LOCK:
@@ -490,6 +527,8 @@ def prepare_whatsapp_cold_start_validation(
                 state["plans"], "plan_id", plan_target_row.get("plan_id")
             )
             if plan_row is None:
+                continue
+            if _json_safe_string(plan_row.get("plan_id")) != plan_id:
                 continue
             if plan_row.get("plan_status") not in {"approved", "active"}:
                 continue
@@ -508,6 +547,17 @@ def prepare_whatsapp_cold_start_validation(
             )
 
             if target_group_chat_id:
+                if target_dm_counterparty_id == dm_counterparty_id:
+                    return _continuity_scope_result(
+                        workflow_status="invalid_request",
+                        founder_summary=(
+                            "WhatsApp cold-start validation could not prepare because v1 validation is direct-message only."
+                        ),
+                        reason="group targets are unsupported for cold-start validation",
+                    )
+                continue
+
+            if target_dm_counterparty_id != dm_counterparty_id:
                 continue
 
             if approved_destination_chat_id is not None:
@@ -542,18 +592,6 @@ def prepare_whatsapp_cold_start_validation(
                     and target_approved_destination_chat_id
                     != approved_destination_chat_id
                 ):
-                    continue
-            else:
-                selector_field = selected_fields[0]
-                if selector_field == "group_chat_id":
-                    return _continuity_scope_result(
-                        workflow_status="invalid_request",
-                        founder_summary=(
-                            "WhatsApp cold-start validation could not prepare because v1 validation is direct-message only."
-                        ),
-                        reason="group targets are unsupported for cold-start validation",
-                    )
-                if plan_target_row.get(selector_field) != selector.get(selector_field):
                     continue
 
             matched_targets.append(plan_target_row)
@@ -597,14 +635,13 @@ def prepare_whatsapp_cold_start_validation(
             "continuity_scope_id": f"wascope-{uuid4()}",
             "plan_target_id": plan_target_row["plan_target_id"],
             "continuity_scope_kind": WHATSAPP_COLD_START_VALIDATION_CONTINUITY_SCOPE_KIND,
-            "cold_start_validation_mode": (
-                WHATSAPP_COLD_START_VALIDATION_MODE_NON_DESTRUCTIVE_ISOLATION
-            ),
+            "cold_start_validation_mode": cold_start_validation_mode,
             "scope_status": WHATSAPP_CONTINUITY_SCOPE_STATUS_PREPARED,
             "target_destination_key": destination_key,
             "target_dm_counterparty_id": dm_counterparty_id,
             "approved_destination_chat_id_snapshot": approved_destination_chat_id
             or _json_safe_string(plan_target_row.get("approved_destination_chat_id")),
+            "validation_prepare_surface": validation_prepare_surface,
             "created_by_principal": created_by_principal,
             "created_at_utc": created_at_utc,
             "operator_reason": operator_reason,
@@ -2346,6 +2383,7 @@ def format_whatsapp_cold_start_validation_result(result: dict[str, Any]) -> str:
             f"target_destination_key: {continuity_scope.get('target_destination_key')}",
             f"target_dm_counterparty_id: {continuity_scope.get('target_dm_counterparty_id')}",
             f"approved_destination_chat_id_snapshot: {continuity_scope.get('approved_destination_chat_id_snapshot')}",
+            f"validation_prepare_surface: {continuity_scope.get('validation_prepare_surface')}",
             f"created_by_principal: {continuity_scope.get('created_by_principal')}",
             f"operator_reason: {continuity_scope.get('operator_reason')}",
             f"created_at_utc: {continuity_scope.get('created_at_utc')}",
